@@ -6,6 +6,14 @@ export interface EnvConfig {
   NODE_ENV: 'development' | 'test' | 'production';
   API_PORT: number;
   WEB_ORIGIN: string;
+  REDIS_HOST: string;
+  REDIS_PORT: number;
+  REDIS_PASSWORD?: string;
+  REDIS_TLS?: boolean;
+  WORKER_ENABLED?: boolean;
+  AUDIT_RECONCILIATION_INTERVAL_MS: number;
+  AUDIT_RECONCILIATION_STALE_THRESHOLD_MS: number;
+  AUDIT_RECONCILIATION_BATCH_SIZE: number;
 }
 
 const KNOWN_INSECURE_PLACEHOLDERS = new Set([
@@ -135,6 +143,106 @@ export function validateEnv(config: Record<string, unknown>): EnvConfig {
     webOrigin = rawOrigin.trim();
   }
 
+  // 8. REDIS_HOST
+  const rawRedisHost = config.REDIS_HOST;
+  let redisHost = 'localhost';
+  if (rawRedisHost !== undefined && rawRedisHost !== null && rawRedisHost !== '') {
+    const trimmed = String(rawRedisHost).trim();
+    if (trimmed.length > 0) {
+      redisHost = trimmed;
+    }
+  }
+
+  // 9. REDIS_PORT
+  const rawRedisPort = config.REDIS_PORT;
+  let redisPort = 6379;
+  if (rawRedisPort !== undefined && rawRedisPort !== null && rawRedisPort !== '') {
+    const parsedRedisPort = Number(rawRedisPort);
+    if (Number.isInteger(parsedRedisPort) && parsedRedisPort >= 1 && parsedRedisPort <= 65535) {
+      redisPort = parsedRedisPort;
+    } else {
+      errors.push('REDIS_PORT must be an integer between 1 and 65535.');
+    }
+  }
+
+  // 10. REDIS_PASSWORD
+  const rawRedisPassword = config.REDIS_PASSWORD;
+  let redisPassword: string | undefined = undefined;
+  if (rawRedisPassword !== undefined && rawRedisPassword !== null && rawRedisPassword !== '') {
+    const trimmed = String(rawRedisPassword).trim();
+    if (trimmed.length > 0) {
+      redisPassword = trimmed;
+    }
+  }
+
+  // 11. REDIS_TLS
+  const rawRedisTls = config.REDIS_TLS;
+  let redisTls = false;
+  if (rawRedisTls !== undefined && rawRedisTls !== null && rawRedisTls !== '') {
+    const stringVal = String(rawRedisTls).trim().toLowerCase();
+    if (stringVal === 'true' || stringVal === '1') {
+      redisTls = true;
+    } else if (stringVal === 'false' || stringVal === '0') {
+      redisTls = false;
+    } else {
+      errors.push("REDIS_TLS must be a boolean ('true' or 'false').");
+    }
+  }
+
+  // 12. WORKER_ENABLED
+  const rawWorkerEnabled = config.WORKER_ENABLED;
+  let workerEnabled = true;
+  if (rawWorkerEnabled !== undefined && rawWorkerEnabled !== null && rawWorkerEnabled !== '') {
+    const stringVal = String(rawWorkerEnabled).trim().toLowerCase();
+    if (stringVal === 'true' || stringVal === '1') {
+      workerEnabled = true;
+    } else if (stringVal === 'false' || stringVal === '0') {
+      workerEnabled = false;
+    } else {
+      errors.push("WORKER_ENABLED must be a boolean ('true' or 'false').");
+    }
+  }
+
+  // 13. AUDIT_RECONCILIATION_INTERVAL_MS
+  const rawReconInterval = config.AUDIT_RECONCILIATION_INTERVAL_MS;
+  let reconIntervalMs = 60000;
+  if (rawReconInterval !== undefined && rawReconInterval !== null && rawReconInterval !== '') {
+    const parsed = Number(rawReconInterval);
+    if (Number.isInteger(parsed) && parsed >= 0) {
+      reconIntervalMs = parsed;
+    } else {
+      errors.push('AUDIT_RECONCILIATION_INTERVAL_MS must be an integer >= 0.');
+    }
+  }
+
+  // 14. AUDIT_RECONCILIATION_STALE_THRESHOLD_MS
+  const rawStaleThreshold = config.AUDIT_RECONCILIATION_STALE_THRESHOLD_MS;
+  let staleThresholdMs = 300000;
+  if (rawStaleThreshold !== undefined && rawStaleThreshold !== null && rawStaleThreshold !== '') {
+    const parsed = Number(rawStaleThreshold);
+    if (Number.isInteger(parsed) && parsed >= 10000) {
+      staleThresholdMs = parsed;
+    } else {
+      errors.push(
+        'AUDIT_RECONCILIATION_STALE_THRESHOLD_MS must be an integer >= 10000 (milliseconds).',
+      );
+    }
+  }
+
+  // 15. AUDIT_RECONCILIATION_BATCH_SIZE
+  const rawBatchSize = config.AUDIT_RECONCILIATION_BATCH_SIZE;
+  let batchSize = 50;
+  if (rawBatchSize !== undefined && rawBatchSize !== null && rawBatchSize !== '') {
+    const parsed = Number(rawBatchSize);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 500) {
+      batchSize = parsed;
+    } else {
+      errors.push(
+        'AUDIT_RECONCILIATION_BATCH_SIZE must be an integer between 1 and 500.',
+      );
+    }
+  }
+
   if (errors.length > 0) {
     throw new Error(`Environment validation failed:\n  - ${errors.join('\n  - ')}`);
   }
@@ -147,5 +255,13 @@ export function validateEnv(config: Record<string, unknown>): EnvConfig {
     NODE_ENV: nodeEnv,
     API_PORT: apiPort,
     WEB_ORIGIN: webOrigin,
+    REDIS_HOST: redisHost,
+    REDIS_PORT: redisPort,
+    REDIS_PASSWORD: redisPassword,
+    REDIS_TLS: redisTls,
+    WORKER_ENABLED: workerEnabled,
+    AUDIT_RECONCILIATION_INTERVAL_MS: reconIntervalMs,
+    AUDIT_RECONCILIATION_STALE_THRESHOLD_MS: staleThresholdMs,
+    AUDIT_RECONCILIATION_BATCH_SIZE: batchSize,
   };
 }

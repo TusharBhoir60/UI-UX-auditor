@@ -9,9 +9,11 @@ import { AuditsService } from './audits.service';
 import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { JwtStrategy } from '../auth/strategies/jwt.strategy';
 import { PrismaService } from '../database/prisma.service';
+import { AuditQueueService } from '../queue/audit-queue.service';
 
 const TEST_JWT_SECRET = 'deterministic-test-jwt-secret-min-32-chars-long';
 const TAMPERED_JWT_SECRET = 'tampered-jwt-secret-used-to-test-invalid-signature';
+
 
 interface StoredAudit {
   id: string;
@@ -40,6 +42,10 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
   let userBToken: string;
   let tamperedToken: string;
   let expiredToken: string;
+
+  const mockAuditQueueService = {
+    addAuditJob: jest.fn().mockResolvedValue(undefined),
+  };
 
   beforeAll(async () => {
     const mockPrismaService = {
@@ -119,6 +125,27 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
             return Promise.resolve(match || null);
           },
         ),
+        updateMany: jest.fn(
+          ({
+            where,
+            data,
+          }: {
+            where: { id: string; status?: string };
+            data: Partial<StoredAudit>;
+          }) => {
+            let count = 0;
+            for (const item of auditStore) {
+              if (
+                item.id === where.id &&
+                (!where.status || item.status === where.status)
+              ) {
+                Object.assign(item, data);
+                count++;
+              }
+            }
+            return Promise.resolve({ count });
+          },
+        ),
       },
     };
 
@@ -145,6 +172,10 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
               return null;
             }),
           },
+        },
+        {
+          provide: AuditQueueService,
+          useValue: mockAuditQueueService,
         },
         JwtStrategy,
         JwtAuthGuard,
@@ -204,6 +235,7 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
   beforeEach(() => {
     // Reset in-memory store before each test to maintain clean isolation
     auditStore = [];
+    mockAuditQueueService.addAuditJob.mockReset().mockResolvedValue(undefined);
   });
 
   afterAll(async () => {
@@ -255,7 +287,7 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
   });
 
   describe('2. POST /api/v1/audits: Creation, Validation & Client userId Rejection', () => {
-    it('creates an audit record returning 201 with { audit_id, status: "queued" }', async () => {
+    it('creates an audit record returning 201 with { audit_id, status: "queued" } and dispatches queue job', async () => {
       const res = await fetch(baseUrl, {
         method: 'POST',
         headers: {
@@ -276,6 +308,34 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
       expect(auditStore[0].userId).toBe(USER_A_ID);
       expect(auditStore[0].url).toBe('https://user-a.example.com');
       expect(auditStore[0].status).toBe('queued');
+
+      // Verify queue dispatch was invoked with the created audit ID
+      expect(mockAuditQueueService.addAuditJob).toHaveBeenCalledTimes(1);
+      expect(mockAuditQueueService.addAuditJob).toHaveBeenCalledWith(data.audit_id);
+    });
+
+    it('returns 500 and updates audit status to failed when queue dispatch fails', async () => {
+      mockAuditQueueService.addAuditJob.mockRejectedValueOnce(
+        new Error('Redis connection refused'),
+      );
+
+      const res = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${userAToken}`,
+        },
+        body: JSON.stringify({ url: 'https://fail-enqueue.example.com' }),
+      });
+
+      expect(res.status).toBe(500);
+      const data = await res.json();
+      expect(data.message).toBe('Failed to enqueue audit for processing');
+
+      // Audit was created, and compensating update transitioned it to failed
+      expect(auditStore).toHaveLength(1);
+      expect(auditStore[0].status).toBe('failed');
+      expect(auditStore[0].failureReason).toBe('Failed to enqueue audit for processing');
     });
 
     it('rejects client-supplied userId with 400 Bad Request', async () => {

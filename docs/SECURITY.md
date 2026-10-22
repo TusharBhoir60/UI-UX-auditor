@@ -7,27 +7,65 @@ This document expands the security requirements introduced in the TRD. All items
 
 ---
 
-## 1. SSRF Protection (Critical)
+## 1. SSRF Protection & Network Isolation (Critical)
 
-The Capture Module fetches whatever URL a user submits. Without controls, this lets a user point the server at internal infrastructure.
+The Capture Module fetches arbitrary user-submitted URLs server-side. Without controls, an attacker can use the headless browser to access internal infrastructure, cloud metadata endpoints, or adjacent container services.
 
-**Required controls:**
-- Resolve the submitted URL's hostname and reject requests to:
-  - Private IP ranges (RFC 1918: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
-  - Loopback (`127.0.0.0/8`, `::1`)
-  - Link-local addresses (`169.254.0.0/16`) — this specifically blocks cloud metadata endpoints (e.g. `169.254.169.254`)
-  - Any internal DNS names resolvable only inside the deployment network
-- Re-validate on every redirect the headless browser follows (DNS rebinding protection) — validating only the initially submitted URL is not sufficient, since a page can redirect to an internal address after the initial check passes.
-- Enforce an allowlist of schemes (`http`, `https` only — no `file://`, `ftp://`, etc.)
+### Application-Level Controls
+Application-level controls act as an initial defense-in-depth gatekeeper before and during browser automation:
+- **Pre-navigation URL & Destination Validation (`DestinationGuardService`):**
+  - Syntactic validation, length checks (<= 2048 chars), and control-character rejection.
+  - Rejection of embedded credentials (`user:pass@host`).
+  - Strict scheme allowlist: `http:` and `https:` only for navigation.
+  - Normalization of hostname and classification of IP literals (unicast only; IPv6 restricted to global unicast `2000::/3`).
+  - System DNS resolution checking all returned A and AAAA records against prohibited CIDRs (RFC 1918, RFC 3927 link-local, loopback, carrier-grade NAT, unique local, etc.).
+- **In-Flight Request Interception (`CaptureService` & `page.route`):**
+  - Every outbound request (navigation, redirects, and subresources) is intercepted and paused before Chromium opens a network socket.
+  - Scheme enforcement: Navigation requests are strictly `http:` or `https:`. Subresources allow inline `data:image/` and `data:font/` assets only. Prohibits `file:`, `blob:`, `javascript:`, `about:`, `ws:`, `wss:`, and `ftp:`.
+  - Redirect tracking & limit enforcement: Redirects are counted at the request level via `req.redirectedFrom()`. Requests exceeding `policy.maxRedirects` are aborted via `route.abort('blockedbyclient')` and terminate the page.
+  - Intermediate redirect validation: HTTP 3xx `Location` targets are resolved and validated via `DestinationGuardService` before Chromium can follow them.
+  - Subresource DNS check budget & deduplication: Distinct hostnames are validated up to `MAX_SUBRESOURCE_DNS_CHECKS` (50). Concurrently requested identical hostnames are deduplicated using a shared promise cache. Exceeded budgets or DNS timeouts (> 2,000ms) fail closed.
 
-## 2. Sandboxing
+### Deployment-Level Controls (Mandatory for Production)
+> **CRITICAL SECURITY REQUIREMENT & LIMITATION:**
+> Application-layer validation (`DestinationGuardService`) and Playwright routing (`page.route()`) **CANNOT** guarantee protection against DNS rebinding or time-of-check/time-of-use (TOCTOU) attacks because Chromium maintains its own internal DNS cache and socket pool independent of Node.js. An attacker controlling an authoritative nameserver can serve a public IP during Node.js validation and an internal IP (e.g., `127.0.0.1` or `169.254.169.254`) when Chromium establishes the TCP socket.
+>
+> **The service CANNOT be claimed as production-safe until the following deployment-level controls are in place and verified:**
+> 1. **Network Namespace Egress Firewalling:** Dedicated container network namespace with egress rules (e.g., iptables/nftables) dropping all outbound traffic to:
+>    - RFC 1918 private subnets: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+>    - Link-local and cloud metadata: `169.254.0.0/16`, `fe80::/10` (specifically blocking `169.254.169.254`)
+>    - Loopback: `127.0.0.0/8`, `::1`
+>    - Internal database and cache segments (PostgreSQL, Redis)
+> 2. **Dedicated Capture Worker Isolation:** Headless browser workers must run on separate compute nodes or ephemeral containers isolated from application API servers.
+> 3. **OS-Level Cgroups & Resource Limits:** Hard kernel-enforced limits on CPU (`--cpus=1.0`) and memory (`--memory=1g --memory-swap=1g`) per worker container.
+> 4. **Reliable Worker Process Termination:** Ephemeral container restarts upon timeout rather than relying purely on in-process `browser.close()` calls.
 
-The headless browser (Playwright) executes arbitrary, untrusted third-party JavaScript by design (that's the page being audited).
+## 2. Sandboxing & Resource Lifecycle
 
-**Required controls:**
-- Run the browser process in an isolated container/sandbox with no access to the internal network segment where PostgreSQL, Redis, or other backend services live.
-- Apply resource limits (CPU, memory, execution time) per capture job to prevent a malicious or pathological page from exhausting worker resources.
-- Disable or restrict browser features not needed for capture (e.g., file downloads, clipboard access, geolocation prompts).
+The headless browser (Playwright) executes untrusted third-party HTML, CSS, and JavaScript.
+
+### Application-Level Controls
+- Chromium sandbox kept strictly ENABLED (no `--no-sandbox` flag).
+- Hard overall timeout (`policy.overallTimeoutMs`, default 30s) bounding the entire capture execution.
+- Idempotent and bounded resource cleanup (`RESOURCE_CLEANUP_TIMEOUT_MS = 2,000ms`) ensuring hung `page.close()`, `context.close()`, or `browser.close()` calls cannot hang the worker.
+- Cancellation guards (`checkCancelled()`) at every async checkpoint preventing late-launched browser processes or delayed async operations from returning success after timeout.
+- Artifact boundary enforcement:
+  - Traversal and returned records strictly bounded to `policy.maxDomElements` (1,000) during computed styles extraction.
+  - Distinguishes total document elements (`domElementCount`) from extracted style records (`computedStylesCount`).
+  - Validates non-empty PNG magic bytes (`0x89504E470D0A1A0A`) on screenshot buffers.
+  - Validates non-empty DOM snapshots and measures size via UTF-8 byte count.
+  - Post-generation size bounds on screenshot (10 MB) and DOM snapshot (5 MB) preventing oversized payloads from propagating downstream.
+- Redirect hop deduplication: Tracks redirect source requests across route requests and 3xx response events to guarantee each hop is counted exactly once without double counting.
+- Restricted browser context: `acceptDownloads: false`, `serviceWorkers: 'block'`, dialogs auto-dismissed, popups auto-closed.
+- Typed error taxonomy & credential redaction:
+  - Stable error taxonomy: `INVALID_TARGET`, `BLOCKED_DESTINATION`, `BLOCKED_REDIRECT`, `DNS_RESOLUTION_FAILED`, `BROWSER_LAUNCH_FAILED`, `NAVIGATION_FAILED`, `TIMEOUT`, `ARTIFACT_GENERATION_FAILED`, `ARTIFACT_LIMIT_EXCEEDED`.
+  - Redaction of embedded credentials (`user:pass@host`) from error reasons and cause messages.
+  - Stack traces and internal network topology suppressed from caller-facing errors.
+
+### Deployment-Level Controls
+- **Post-Generation Artifact Size Check Limitations:** Post-generation artifact size checks do NOT prevent in-process memory allocation during rendering in Chromium or V8. Pathological pages (e.g. DOM bombs with 500,000 elements) require container memory ceilings (cgroups `--memory=1g`) to prevent worker host OOM.
+- **In-Process Timeout Limitations:** In-process timeouts (`overallTimeoutMs`, `navigationTimeoutMs`) and bounded cleanup (`closeWithTimeout`) bound Node.js event-loop execution, but do NOT guarantee OS-level process termination of an unresponsive or zombie Chromium process. Ephemeral container termination / supervisor process restart upon timeout is mandatory.
+
 
 ## 3. Prompt Injection Resistance
 
@@ -65,7 +103,39 @@ Each audit consumes real cost (headless browser compute + AI API calls), so this
 - Captured screenshots and DOM snapshots of third-party websites are stored per-audit; retention policy should be defined (even a simple "kept indefinitely, deletable by the owning user" is acceptable for MVP, but must be a conscious decision, not an oversight).
 - No captured data is shared across users; Object Storage paths should be non-guessable (random IDs, not sequential) even though access is also enforced at the API layer — defense in depth.
 
-## 8. Explicitly Deferred (Phase 2+, but noted here for awareness)
+## 8. Job Queue & Asynchronous Processing Security (BullMQ + Redis)
+
+The introduction of asynchronous background workers creates additional trust boundaries and infrastructure components that must be secured:
+
+- **Queue Payload Isolation:**
+  - Queue payloads carry strictly minimal, non-sensitive metadata: `{ auditId: string }`.
+  - Raw URLs, user-supplied headers, session tokens, or credentials are strictly excluded from queue payloads.
+  - The worker strictly resolves the authoritative target URL directly from PostgreSQL by audit ID, preventing queue-level injection or URL tampering.
+- **Error Sanitization & Secret Redaction:**
+  - All worker error handlers and queue event handlers sanitize error messages via `sanitizeErrorMessage`.
+  - Credentials (`user:pass@host`), database connection strings, raw target URLs, DOM snapshots, screenshots, or stack traces containing secrets are never logged to console or queue event logs.
+- **No Public Queue Endpoints:**
+  - Neither BullMQ UI, Redis administrative commands, nor internal queue management endpoints are exposed via public HTTP controllers.
+- **Redis Infrastructure Security:**
+  - Validated environment configuration enforces strong connection handling with optional authentication (`REDIS_PASSWORD`) and TLS encryption (`REDIS_TLS`).
+  - Redis connection credentials are never included in error messages or environment validation logs.
+  - Production deployments require Redis to run within an isolated internal subnet with strict firewalling, disallowing direct ingress from external untrusted networks or browser sandboxes.
+- **Atomic State Transitions & Safe Duplicate Delivery:**
+  - Workers rely strictly on atomic conditional state transitions in PostgreSQL (`updateMany where status = 'queued'`) to claim execution authority.
+  - Duplicate deliveries or retries for already running or completed audits are safely acknowledged without overwriting state or re-executing captures.
+  - Enqueue failures trigger compensating updates marking the audit as `failed`, ensuring jobs are never left silently stranded.
+- **Stale Audit Reconciliation Security:**
+  - Bounded queries (`take: batchSize`, default 50, maximum 500) prevent unbounded memory growth and database resource exhaustion during reconciliation sweeps.
+  - Reconciliation exclusively queries audits in `status = 'queued'` and verifies BullMQ job states before re-enqueueing.
+  - Re-enqueue uses the stable audit-based `jobId`; no user input or payload URLs are processed.
+  - Structured operational logs redact credentials, database connection strings, and sensitive URLs (`[Reconciliation Succeeded]`, `[Reconciliation Failed]`).
+  - Single-process mutex guards prevent concurrent reconciliation overlap within a running instance.
+- **Worker Container Isolation (`WORKER_ENABLED`):**
+  - Production deployments enforce complete process separation between public-facing API servers (`WORKER_ENABLED=false`) and dedicated background workers (`WORKER_ENABLED=true`).
+  - Web/API containers run without browser binaries or Playwright execution permissions.
+  - Worker containers execute inside locked-down container environments with strict cgroups, memory limits, and egress network rules dropping private IP ranges.
+
+## 9. Explicitly Deferred (Phase 2+, but noted here for awareness)
 
 - Multi-tenant data isolation beyond per-user (relevant once team accounts exist — Phase 3)
 - Public shareable report links will need their own token-based access model with expiry — not designed yet, since the feature itself is Phase 2

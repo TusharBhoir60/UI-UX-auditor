@@ -107,6 +107,94 @@ This replaces an earlier default of Java + Spring Boot. Reasoning, compared agai
 
 Failure at any stage (esp. step 3-4: page unreachable, blocked, requires auth) marks the job `failed` with a specific, user-facing reason — never a silent empty report. If step 6 (AI) fails but step 5 succeeded, the report is still generated from deterministic findings, flagged as partial.
 
+### 4a. Capture Module / Pipeline Orchestration Boundary
+
+To preserve strict modular boundaries and maintain testability, the Capture Module is decoupled from orchestration and storage concerns:
+
+- **Interface Contract:**
+  - **Invocation:** `CaptureService.capture({ url: string }, policy?: Partial<CapturePolicy>): Promise<CaptureResult>`
+  - **Inputs:** A single URL string provided by the pipeline orchestrator. Destination validation (`DestinationGuardService`) is mandatory and enforced fail-closed prior to browser navigation.
+  - **Outputs:** In-memory `CaptureResult` containing only:
+    - `metadata`: `CaptureMetadata` (timestamps, duration, viewport, element/style/byte counts, resolved IPs, redirect count)
+    - `screenshot`: Raw `Buffer` (validated PNG header)
+    - `domSnapshot`: `string` (UTF-8 HTML)
+    - `computedStyles`: `ElementComputedStyle[]` (bounded to `maxDomElements`)
+    - `validatedDestination`: `ValidatedDestination` (normalized destination details)
+  - **Encapsulation:** No browser handles, Playwright pages, browser contexts, or routing hooks escape `CaptureModule`.
+- **Architectural Non-Goals for Capture Module:**
+  - **No Database Persistence:** `CaptureModule` does not inject `PrismaService` or touch the database. Persisting `AuditCapture` records is the responsibility of the Stage 5 worker/orchestrator.
+  - **No Queue Coupling:** Does not depend on BullMQ or Redis.
+  - **No Object Storage Side-Effects:** Uploading screenshots or artifacts to S3/R2 is handled downstream in the pipeline.
+  - **No HTTP Exposure:** `CaptureService` is an internal service, not bound to any HTTP controller or public route.
+- **Error Semantics & Mapping:**
+  - Throws typed `CaptureError` with stable codes (`INVALID_TARGET`, `BLOCKED_DESTINATION`, `BLOCKED_REDIRECT`, `DNS_RESOLUTION_FAILED`, `BROWSER_LAUNCH_FAILED`, `NAVIGATION_FAILED`, `TIMEOUT`, `ARTIFACT_GENERATION_FAILED`, `ARTIFACT_LIMIT_EXCEEDED`).
+  - Error messages redact raw credentials (`user:pass@host`) and suppress internal stack traces.
+  - The pipeline orchestrator maps `CaptureError` directly to `Audit.status = 'failed'` with `failureReason = err.safeReason`.
+- **Lifecycle & Resource Ownership:**
+  - `CaptureService` owns the full Chromium lifecycle, ensuring idempotent, bounded cleanup (`RESOURCE_CLEANUP_TIMEOUT_MS = 2,000ms`) on success, error, or cancellation.
+- **Production Deployment Gates (Unchanged):**
+  - Production readiness strictly requires network namespace egress firewalling (dropping RFC 1918 / link-local / cloud metadata), dedicated worker container isolation, kernel cgroups (`--cpus=1.0`, `--memory=1g`), and supervisor-level container restarts on timeout.
+
+### 4b. Asynchronous Audit Queue Integration (BullMQ + Redis)
+
+To decouple HTTP audit submission from browser execution and external network latency, an asynchronous queue is integrated using BullMQ and Redis:
+
+- **Queue Topology & Responsibilities:**
+  - **Queue (`audit-processing`):** Managed by `AuditQueueService`, responsible for job dispatch upon audit creation.
+  - **Worker (`AuditWorkerProcessor`):** Consumes jobs from `audit-processing` with configurable concurrency (default: 1) and delegates job execution to `AuditOrchestratorService.processAudit(auditId)`.
+  - **Execution Authority (`AuditOrchestratorService`):** Strictly owns all database state transitions (`queued` → `running` → `complete` / `failed`). The worker does not duplicate or alter state machine logic.
+- **Job Payload Contract:**
+  - Queue payloads carry strictly minimal, non-sensitive metadata: `{ auditId: string, createdAt?: string }`.
+  - **Authoritative URL Resolution:** Raw URLs, credentials, or user inputs are never passed through queue payloads. The worker and orchestrator strictly load the target URL from PostgreSQL by audit ID, preventing payload spoofing or URL tampering.
+  - **No Public HTTP Queue Exposure:** Queue management and internal job metrics are not exposed through public HTTP controllers.
+- **Database-to-Queue Consistency Boundary & Dual-Write Gap:**
+  - Dual writes across PostgreSQL and Redis are not atomic.
+  - **Dispatch Workflow:**
+    1. The audit record is committed to PostgreSQL in `queued` status.
+    2. The job is enqueued in BullMQ with `jobId: audit.id`.
+    3. If Redis enqueue fails (connection error or timeout):
+       - A compensating update immediately transitions the audit to `failed` with `failureReason = 'Failed to enqueue audit for processing'`.
+       - The API returns an observable HTTP 500 (`InternalServerErrorException`) to the client.
+    4. If the compensating update itself fails, or if Redis accepted the job without API ACK, the audit could remain stranded in `queued`. This dual-write failure window is resolved by the Stale Audit Reconciliation mechanism.
+  - **Transactional Outbox Evaluation:** An outbox pattern was evaluated. Since the source-of-truth database schema (`DATABASE.md`, `DATA_MODEL.md`) deliberately omits an outbox table for MVP, the immediate compensating failure update coupled with idempotent worker state claims and stale audit reconciliation provides observable recovery semantics without speculative schema additions.
+- **Duplicate Delivery & Retry Policy:**
+  - **Stable Job Identity:** Jobs use `auditId` as the BullMQ `jobId`, preventing duplicate enqueue requests from creating concurrent jobs in Redis.
+  - **Conservative Retries (`attempts: 1`):** The current schema lacks fencing tokens or attempt ownership columns. Automatic retries by BullMQ could race with concurrent workers or overwrite audit state; therefore, automatic retries are disabled (`attempts: 1`).
+  - **Bounded Retention:** Completed jobs are retained for 24 hours (or up to 1,000 jobs) and failed jobs for 7 days (or up to 5,000 jobs) for operational diagnosis without unbounded memory growth.
+- **Stale Queued Audit Reconciliation:**
+  - Managed by `AuditReconciliationService`, running as a periodic background reconciliation loop.
+  - **Configuration:**
+    - `AUDIT_RECONCILIATION_INTERVAL_MS`: Polling interval in ms (default: `60000` / 1 minute; set to `0` to disable the recurring timer).
+    - `AUDIT_RECONCILIATION_STALE_THRESHOLD_MS`: Age threshold in ms before a `queued` audit is considered stale (default: `300000` / 5 minutes; minimum: `10000` / 10 seconds).
+    - `AUDIT_RECONCILIATION_BATCH_SIZE`: Maximum audits processed per batch (default: `50`; range: `1..500`).
+  - **Discovery Query:** Selects audits matching `status = 'queued'` and `createdAt <= (now - staleThreshold)`, sorted by `createdAt ASC`, strictly bounded by `take: batchSize`. Terminal (`complete`, `failed`) and running (`running`) audits are strictly excluded.
+  - **Concurrency & Overlap Prevention:**
+    - Single-process mutex (`isReconciling` flag) prevents overlapping runs within a single instance.
+    - Across multi-replica deployments, BullMQ stable `jobId` deduplication and PostgreSQL atomic conditional status claims (`updateMany where status = 'queued'`) prevent duplicate execution.
+  - **BullMQ Idempotency & Re-Enqueue Semantics:**
+    - BullMQ will reject/ignore `queue.add()` for jobs whose `jobId` already exists in `failed` or `completed` state under retention.
+    - `AuditQueueService.reconcileAuditJob` inspects existing job status:
+      - If `waiting`, `delayed`, or `prioritized`: Logged as `already_waiting` and left untouched.
+      - If `active`: Logged as `already_active` and left untouched.
+      - If `completed` or `failed` (retained terminal job in Redis while PostgreSQL still records `queued`): Stale job is removed via `existingJob.remove()` and re-enqueued fresh with `jobId: auditId`.
+      - If non-existent in Redis: Freshly enqueued with `jobId: auditId`.
+  - **Resilience & Fault Isolation:**
+    - Database query errors are safely caught, logged, and abort the current cycle without crashing the host process.
+    - Redis errors during per-audit re-enqueue are caught and logged individually without aborting remaining batch items.
+- **Queue and Module Lifecycle:**
+  - Validated environment configuration: `REDIS_HOST` (default `localhost`), `REDIS_PORT` (default `6379`), optional `REDIS_PASSWORD`, and optional `REDIS_TLS`.
+  - `WORKER_ENABLED` (boolean, default: `true`): Allows splitting API and Worker deployments into distinct container roles.
+    - API container: `WORKER_ENABLED=false` (handles HTTP ingestion, queue dispatch, and reconciliation without initializing Playwright or browser processes).
+    - Worker container: `WORKER_ENABLED=true` (processes background capture jobs with browser sandboxing and OS-level cgroups).
+  - Queue, worker, and reconciliation lifecycle managed via NestJS `OnModuleInit` and `OnModuleDestroy` hooks (`queue.close()`, `worker.close()`, `clearInterval()`).
+  - Bounded connection timeouts (5,000ms) and retry strategies prevent worker or startup hangs during Redis unreachability.
+  - **Module Dependencies & `forwardRef()`:**
+    - Monolithic packaging uses `forwardRef()` between `AuditsModule` and `QueueModule` because `AuditsService` creates queue jobs while `AuditWorkerProcessor` delegates to `AuditOrchestratorService`.
+    - In container-isolated production deployments, API containers omit `AuditWorkerProcessor` and Worker containers omit `AuditsController`, eliminating cyclic dependencies.
+- **Remaining Limitations & Future Enhancements:**
+  - *Indefinite Infrastructure Outages:* Reconciliation cannot guarantee recovery if Redis or PostgreSQL remains permanently unavailable; recovery occurs deterministically once services become reachable.
+  - *Fencing Tokens:* Stage 6+ multi-stage pipeline extension should introduce a fencing token or attempt-counter on `Audit` to allow safe multi-attempt automatic retries.
+
 ## 5. Key Architectural Decisions
 
 | # | Decision | Chosen Approach | Reasoning | Reversible later? |
