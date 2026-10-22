@@ -46,6 +46,67 @@ All endpoints except `/auth/*` require a valid session/JWT. All Audit-scoped end
 - **Response:** `200` with `{ status, stage, failure_reason (nullable) }`
 - **Auth required:** Yes
 
+### `GET /audits/{auditId}/results`
+- **Purpose:** Full audit results endpoint returning authoritative audit metadata, aggregated finding counts by severity and category, persisted issues, and associated grounded evidence.
+- **Route:** `GET /api/v1/audits/{auditId}/results`
+- **Auth required:** Yes (JWT via Bearer header)
+- **Ownership:** Scoped strictly to the authenticated user. If the audit does not exist or belongs to another user, returns `404 Not Found` with `{"statusCode": 404, "message": "Audit not found"}` (anti-enumeration).
+- **Ordering:** Issues are deterministically sorted by severity (`Critical` -> `High` -> `Medium` -> `Low`), then `createdAt` ascending (oldest first), with `id` ascending as a tie-breaker. Evidence records within each issue are ordered by `createdAt` ascending, `id` ascending.
+- **Incomplete / Failed Audits:** The audit `status` remains authoritative (`queued`, `running`, `complete`, `failed`). The API never falsely reports an audit as `complete` merely because Issue rows exist.
+- **Zero Findings:** A completed audit with zero findings returns `status: "complete"`, `summary.total: 0`, all category/severity counts `0`, and `issues: []`.
+- **Response:** `200` with:
+  ```json
+  {
+    "audit_id": "22222222-2222-4222-8222-222222222222",
+    "url": "https://example.com",
+    "status": "complete",
+    "failure_reason": null,
+    "created_at": "2026-10-23T01:00:00.000Z",
+    "completed_at": "2026-10-23T01:01:00.000Z",
+    "summary": {
+      "total": 2,
+      "by_severity": {
+        "Critical": 1,
+        "High": 0,
+        "Medium": 0,
+        "Low": 1
+      },
+      "by_category": {
+        "accessibility": 1,
+        "visual": 1,
+        "usability": 0
+      }
+    },
+    "issues": [
+      {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "audit_id": "22222222-2222-4222-8222-222222222222",
+        "category": "accessibility",
+        "title": "Button lacks an accessible name",
+        "description": "The <button> has no visible text or label.",
+        "severity": "Critical",
+        "confidence": "deterministic",
+        "standard_reference": "WCAG 4.1.2",
+        "recommendation": "Add visible text or aria-label.",
+        "status": "open",
+        "created_at": "2026-10-23T01:00:30.000Z",
+        "evidence": [
+          {
+            "id": "44444444-4444-4444-8444-444444444444",
+            "issue_id": "33333333-3333-4333-8333-333333333333",
+            "dom_selector": "button#submit",
+            "snippet": "<button id=\"submit\"></button>",
+            "highlighted_region": { "x": 10, "y": 20, "width": 100, "height": 40 },
+            "screenshot_crop_url": null,
+            "created_at": "2026-10-23T01:00:30.000Z"
+          }
+        ]
+      }
+    ]
+  }
+  ```
+
+
 ---
 
 ## Issues

@@ -17,6 +17,7 @@ import {
   AuditCreationResponse,
   AuditDetailResponse,
   AuditListItemResponse,
+  AuditResultsResponse,
   AuditStatusResponse,
 } from './audits.types';
 
@@ -71,5 +72,18 @@ export class AuditsController {
     @Param('auditId', new ParseUUIDPipe()) auditId: string,
   ): Promise<AuditStatusResponse> {
     return this.auditsService.getStatus(userId, auditId);
+  }
+
+  /**
+   * GET /api/v1/audits/:auditId/results
+   * Retrieves aggregated results, summary counts, issues, and evidence for an audit.
+   * Scoped to the authenticated owner.
+   */
+  @Get(':auditId/results')
+  getResults(
+    @CurrentUser('id') userId: string,
+    @Param('auditId', new ParseUUIDPipe()) auditId: string,
+  ): Promise<AuditResultsResponse> {
+    return this.auditsService.getResults(userId, auditId);
   }
 }

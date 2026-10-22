@@ -10,10 +10,10 @@ import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
 import { JwtStrategy } from '../auth/strategies/jwt.strategy';
 import { PrismaService } from '../database/prisma.service';
 import { AuditQueueService } from '../queue/audit-queue.service';
+import { AuditFindingsService } from './audit-findings.service';
 
 const TEST_JWT_SECRET = 'deterministic-test-jwt-secret-min-32-chars-long';
 const TAMPERED_JWT_SECRET = 'tampered-jwt-secret-used-to-test-invalid-signature';
-
 
 interface StoredAudit {
   id: string;
@@ -25,6 +25,31 @@ interface StoredAudit {
   completedAt: Date | null;
 }
 
+interface StoredEvidence {
+  id: string;
+  issueId: string;
+  domSelector: string | null;
+  snippet: string | null;
+  highlightedRegion: unknown;
+  screenshotCropUrl: string | null;
+  createdAt: Date;
+}
+
+interface StoredIssue {
+  id: string;
+  auditId: string;
+  category: 'accessibility' | 'visual' | 'usability';
+  title: string;
+  description: string;
+  severity: 'Critical' | 'High' | 'Medium' | 'Low';
+  confidence: 'deterministic' | 'high' | 'medium' | 'low';
+  standardReference: string | null;
+  recommendation: string;
+  status: 'open' | 'acknowledged' | 'fixed';
+  createdAt: Date;
+  evidence?: StoredEvidence[];
+}
+
 describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => {
   let app: INestApplication;
   let baseUrl: string;
@@ -33,6 +58,9 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
 
   // In-memory database store for clean cross-user isolation
   let auditStore: StoredAudit[] = [];
+  let issueStore: StoredIssue[] = [];
+  let evidenceStore: StoredEvidence[] = [];
+
 
   const USER_A_ID = '11111111-1111-4111-8111-111111111111';
   const USER_B_ID = '22222222-2222-4222-8222-222222222222';
@@ -147,6 +175,17 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
           },
         ),
       },
+      issue: {
+        findMany: jest.fn(({ where }: { where: { auditId: string } }) => {
+          const matched = issueStore
+            .filter((i) => i.auditId === where.auditId)
+            .map((i) => ({
+              ...i,
+              evidence: evidenceStore.filter((e) => e.issueId === i.id),
+            }));
+          return Promise.resolve(matched);
+        }),
+      },
     };
 
     const moduleFixture: TestingModule = await Test.createTestingModule({
@@ -160,6 +199,7 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
       controllers: [AuditsController],
       providers: [
         AuditsService,
+        AuditFindingsService,
         {
           provide: PrismaService,
           useValue: mockPrismaService,
@@ -180,6 +220,7 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
         JwtStrategy,
         JwtAuthGuard,
       ],
+
     }).compile();
 
     jwtService = moduleFixture.get<JwtService>(JwtService);
@@ -235,6 +276,8 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
   beforeEach(() => {
     // Reset in-memory store before each test to maintain clean isolation
     auditStore = [];
+    issueStore = [];
+    evidenceStore = [];
     mockAuditQueueService.addAuditJob.mockReset().mockResolvedValue(undefined);
   });
 
@@ -248,7 +291,9 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
       { method: 'GET', path: '' },
       { method: 'GET', path: '/00000000-0000-4000-8000-000000000000' },
       { method: 'GET', path: '/00000000-0000-4000-8000-000000000000/status' },
+      { method: 'GET', path: '/00000000-0000-4000-8000-000000000000/results' },
     ];
+
 
     for (const ep of endpoints) {
       it(`${ep.method} /api/v1/audits${ep.path} returns 401 when Authorization header is missing`, async () => {
@@ -608,6 +653,280 @@ describe('Audits Endpoints HTTP-Level Integration & Ownership Isolation', () => 
       expect(res.status).toBe(400);
       const data = await res.json();
       expect(data.message).toContain('Validation failed');
+    });
+  });
+
+  describe('6. Cross-User Results & Findings Aggregation (GET /api/v1/audits/:auditId/results)', () => {
+    it('returns audit results with aggregated counts, issues, and evidence for owned completed audit', async () => {
+      // Create Audit A
+      const createResA = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${userAToken}`,
+        },
+        body: JSON.stringify({ url: 'https://user-a.example.com' }),
+      });
+      const { audit_id: auditAId } = await createResA.json();
+
+      // Mark Audit A as complete in store
+      const auditRec = auditStore.find((a) => a.id === auditAId)!;
+      auditRec.status = 'complete';
+      auditRec.completedAt = new Date('2026-10-23T02:00:00.000Z');
+
+      // Add issues and evidence to stores
+      const issueId1 = randomUUID();
+      const issueId2 = randomUUID();
+
+      issueStore.push(
+        {
+          id: issueId1,
+          auditId: auditAId,
+          category: 'accessibility',
+          title: 'Button missing accessible name',
+          description: '<button> lacks inner text or aria label',
+          severity: 'Critical',
+          confidence: 'deterministic',
+          standardReference: 'WCAG 4.1.2',
+          recommendation: 'Add accessible name',
+          status: 'open',
+          createdAt: new Date('2026-10-23T01:59:00.000Z'),
+        },
+        {
+          id: issueId2,
+          auditId: auditAId,
+          category: 'visual',
+          title: 'Heading order skipped',
+          description: 'Heading skipped from h1 to h3',
+          severity: 'Low',
+          confidence: 'deterministic',
+          standardReference: 'WCAG 1.3.1',
+          recommendation: 'Use sequential heading levels',
+          status: 'open',
+          createdAt: new Date('2026-10-23T01:59:30.000Z'),
+        },
+      );
+
+      const evId1 = randomUUID();
+      evidenceStore.push({
+        id: evId1,
+        issueId: issueId1,
+        domSelector: 'button#btn',
+        snippet: '<button id="btn"></button>',
+        highlightedRegion: { x: 50, y: 100, width: 80, height: 32 },
+        screenshotCropUrl: null,
+        createdAt: new Date('2026-10-23T01:59:00.000Z'),
+      });
+
+      // User A accesses results
+      const resOwn = await fetch(`${baseUrl}/${auditAId}/results`, {
+        headers: { Authorization: `Bearer ${userAToken}` },
+      });
+      expect(resOwn.status).toBe(200);
+      const results = await resOwn.json();
+
+      expect(results.audit_id).toBe(auditAId);
+      expect(results.url).toBe('https://user-a.example.com');
+      expect(results.status).toBe('complete');
+      expect(results.failure_reason).toBeNull();
+      expect(results.completed_at).toBe('2026-10-23T02:00:00.000Z');
+
+      // Summary counts check
+      expect(results.summary).toEqual({
+        total: 2,
+        by_severity: {
+          Critical: 1,
+          High: 0,
+          Medium: 0,
+          Low: 1,
+        },
+        by_category: {
+          accessibility: 1,
+          visual: 1,
+          usability: 0,
+        },
+      });
+
+      // Issues and evidence mapping check
+      expect(results.issues).toHaveLength(2);
+      expect(results.issues[0].id).toBe(issueId1);
+      expect(results.issues[0].evidence).toHaveLength(1);
+      expect(results.issues[0].evidence[0].dom_selector).toBe('button#btn');
+      expect(results.issues[0].evidence[0].highlighted_region).toEqual({
+        x: 50,
+        y: 100,
+        width: 80,
+        height: 32,
+      });
+
+      expect(results.issues[1].id).toBe(issueId2);
+      expect(results.issues[1].evidence).toHaveLength(0);
+    });
+
+    it('returns 404 for another user audit results and nonexistent audit results (anti-enumeration)', async () => {
+      // User B creates Audit B
+      const createResB = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${userBToken}`,
+        },
+        body: JSON.stringify({ url: 'https://user-b.example.com' }),
+      });
+      const { audit_id: auditBId } = await createResB.json();
+
+      // User A attempts to access User B's audit results -> 404
+      const resCrossUser = await fetch(`${baseUrl}/${auditBId}/results`, {
+        headers: { Authorization: `Bearer ${userAToken}` },
+      });
+      expect(resCrossUser.status).toBe(404);
+      const crossData = await resCrossUser.json();
+      expect(crossData.message).toBe('Audit not found');
+
+      // User A attempts to access nonexistent audit results -> identical 404
+      const resNonexistent = await fetch(
+        `${baseUrl}/${NONEXISTENT_AUDIT_ID}/results`,
+        {
+          headers: { Authorization: `Bearer ${userAToken}` },
+        },
+      );
+      expect(resNonexistent.status).toBe(404);
+      const nonexistentData = await resNonexistent.json();
+      expect(nonexistentData.message).toBe('Audit not found');
+
+      expect(crossData).toEqual(nonexistentData);
+    });
+
+    it('returns 400 Bad Request for malformed UUID before database query', async () => {
+      const res = await fetch(`${baseUrl}/bad-uuid/results`, {
+        headers: { Authorization: `Bearer ${userAToken}` },
+      });
+      expect(res.status).toBe(400);
+      const data = await res.json();
+      expect(data.message).toContain('Validation failed');
+    });
+
+    it('ignores caller-supplied userId in query parameter and derives ownership strictly from token', async () => {
+      // User B creates Audit B
+      const createResB = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${userBToken}`,
+        },
+        body: JSON.stringify({ url: 'https://user-b.example.com' }),
+      });
+      const { audit_id: auditBId } = await createResB.json();
+
+      // User A attempts to access User B's audit by supplying userId=USER_B_ID in query string -> 404
+      const resTamperedQuery = await fetch(
+        `${baseUrl}/${auditBId}/results?userId=${USER_B_ID}`,
+        {
+          headers: { Authorization: `Bearer ${userAToken}` },
+        },
+      );
+      expect(resTamperedQuery.status).toBe(404);
+      const data = await resTamperedQuery.json();
+      expect(data.message).toBe('Audit not found');
+    });
+
+    it('returns 200 with zero summary counts and empty issues for completed audit with zero findings', async () => {
+      const createRes = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${userAToken}`,
+        },
+        body: JSON.stringify({ url: 'https://clean-site.example.com' }),
+      });
+      const { audit_id: auditId } = await createRes.json();
+
+      const auditRec = auditStore.find((a) => a.id === auditId)!;
+      auditRec.status = 'complete';
+      auditRec.completedAt = new Date('2026-10-23T02:00:00.000Z');
+
+      const res = await fetch(`${baseUrl}/${auditId}/results`, {
+        headers: { Authorization: `Bearer ${userAToken}` },
+      });
+      expect(res.status).toBe(200);
+      const results = await res.json();
+
+      expect(results.status).toBe('complete');
+      expect(results.summary).toEqual({
+        total: 0,
+        by_severity: { Critical: 0, High: 0, Medium: 0, Low: 0 },
+        by_category: { accessibility: 0, visual: 0, usability: 0 },
+      });
+      expect(results.issues).toEqual([]);
+    });
+
+    it('honestly represents running audit status without misrepresenting as complete', async () => {
+      const createRes = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${userAToken}`,
+        },
+        body: JSON.stringify({ url: 'https://processing-site.example.com' }),
+      });
+      const { audit_id: auditId } = await createRes.json();
+
+      const auditRec = auditStore.find((a) => a.id === auditId)!;
+      auditRec.status = 'running';
+
+      const res = await fetch(`${baseUrl}/${auditId}/results`, {
+        headers: { Authorization: `Bearer ${userAToken}` },
+      });
+      expect(res.status).toBe(200);
+      const results = await res.json();
+
+      expect(results.status).toBe('running');
+      expect(results.completed_at).toBeNull();
+    });
+
+    it('honestly represents failed audit status with failure reason and does not report complete even if findings exist', async () => {
+      const createRes = await fetch(baseUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${userAToken}`,
+        },
+        body: JSON.stringify({ url: 'https://failed-site.example.com' }),
+      });
+      const { audit_id: auditId } = await createRes.json();
+
+      const auditRec = auditStore.find((a) => a.id === auditId)!;
+      auditRec.status = 'failed';
+      auditRec.failureReason = 'Capture timeout exceeded';
+      auditRec.completedAt = new Date('2026-10-23T02:00:00.000Z');
+
+      // Findings persisted before crash
+      const issueId = randomUUID();
+      issueStore.push({
+        id: issueId,
+        auditId,
+        category: 'accessibility',
+        title: 'Image missing alt',
+        description: '<img> without alt',
+        severity: 'Critical',
+        confidence: 'deterministic',
+        standardReference: 'WCAG 1.1.1',
+        recommendation: 'Add alt',
+        status: 'open',
+        createdAt: new Date('2026-10-23T01:59:00.000Z'),
+      });
+
+      const res = await fetch(`${baseUrl}/${auditId}/results`, {
+        headers: { Authorization: `Bearer ${userAToken}` },
+      });
+      expect(res.status).toBe(200);
+      const results = await res.json();
+
+      // Must remain authoritative from database: failed, NOT complete
+      expect(results.status).toBe('failed');
+      expect(results.failure_reason).toBe('Capture timeout exceeded');
+      expect(results.summary.total).toBe(1);
+      expect(results.issues).toHaveLength(1);
     });
   });
 });

@@ -10,6 +10,7 @@ describe('AuditsController', () => {
     findAll: jest.Mock;
     findOne: jest.Mock;
     getStatus: jest.Mock;
+    getResults: jest.Mock;
   };
 
   const USER_ID = 'user-uuid-1111';
@@ -21,6 +22,7 @@ describe('AuditsController', () => {
       findAll: jest.fn(),
       findOne: jest.fn(),
       getStatus: jest.fn(),
+      getResults: jest.fn(),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -97,6 +99,29 @@ describe('AuditsController', () => {
     const result = await controller.getStatus(USER_ID, AUDIT_ID);
 
     expect(mockAuditsService.getStatus).toHaveBeenCalledWith(USER_ID, AUDIT_ID);
+    expect(result).toBe(expected);
+  });
+
+  it('delegates getResults to AuditsService with extracted userId and auditId', async () => {
+    const expected = {
+      audit_id: AUDIT_ID,
+      url: 'https://example.com',
+      status: 'complete',
+      failure_reason: null,
+      created_at: '2026-10-22T10:00:00.000Z',
+      completed_at: '2026-10-22T10:01:00.000Z',
+      summary: {
+        total: 1,
+        by_severity: { Critical: 1, High: 0, Medium: 0, Low: 0 },
+        by_category: { accessibility: 1, visual: 0, usability: 0 },
+      },
+      issues: [],
+    };
+    mockAuditsService.getResults.mockResolvedValueOnce(expected);
+
+    const result = await controller.getResults(USER_ID, AUDIT_ID);
+
+    expect(mockAuditsService.getResults).toHaveBeenCalledWith(USER_ID, AUDIT_ID);
     expect(result).toBe(expected);
   });
 });

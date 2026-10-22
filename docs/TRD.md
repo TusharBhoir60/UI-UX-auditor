@@ -273,6 +273,27 @@ To establish high trust and reproducible audit outcomes, deterministic analysis 
   - *Dynamic DOM:* Single-page applications mutating DOM after initial network idle may produce selectors requiring re-evaluation on live DOM.
   - *Deferred models:* `AuditCapture`, `Report`, and `Job` models from `DATA_MODEL.md` remain deferred; capture artifacts are transient in memory during MVP execution.
 
+### 4e. Audit Results API and Finding Aggregation
+
+- **Read Endpoint (`GET /api/v1/audits/:auditId/results`):**
+  - Exposes persisted deterministic audit findings, finding summary counts, issues, and evidence records to authenticated clients.
+  - Ownership Enforcement: Uses `JwtAuthGuard` and extracts `userId` from verified token claims. Checks ownership via `prisma.audit.findFirst({ where: { id: auditId, userId } })`. If not found or owned by another user, returns identical `404 Not Found` (anti-enumeration). Caller-supplied ownership identifiers (e.g. query params) cannot bypass authorization.
+  - Status Authoritativeness: The response status directly reflects `Audit.status` (`queued`, `running`, `complete`, `failed`). The presence of `Issue` records in PostgreSQL never alters or overrides the audit status.
+  - Aggregation Semantics:
+    - Summary counts are computed directly from the fetched issues list (`total`, `by_severity`, `by_category`), guaranteeing snapshot consistency without multi-query race conditions or N+1 queries.
+    - All severity (`Critical`, `High`, `Medium`, `Low`) and category (`accessibility`, `visual`, `usability`) keys are guaranteed initialized to `0`.
+  - Issue Ordering Guarantees:
+    - Issues are deterministically ordered:
+      1. Severity: `Critical` -> `High` -> `Medium` -> `Low`
+      2. Creation time: `createdAt` ascending (oldest first)
+      3. ID: `id` ascending (lexicographical tie-breaker)
+    - Evidence records within each issue are ordered by `createdAt` ascending, `id` ascending.
+  - Terminal-State and Edge-Case Handling:
+    - *Completed audit with 0 findings:* Returns `status: 'complete'`, `summary.total: 0`, all category/severity counts `0`, and `issues: []`.
+    - *Queued / Running audit:* Returns `status: 'queued'` or `'running'`, `completed_at: null`, and honest in-progress state.
+    - *Failed audit:* Returns `status: 'failed'`, populated `failure_reason`, and any findings persisted prior to terminal failure without misrepresenting the audit as complete.
+    - *Missing optional evidence:* Null values for `domSelector`, `snippet`, `highlightedRegion`, and `screenshotCropUrl` are safely serialized without runtime errors.
+
 ## 5. Key Architectural Decisions
 
 | # | Decision | Chosen Approach | Reasoning | Reversible later? |
