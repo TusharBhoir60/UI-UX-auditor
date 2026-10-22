@@ -71,3 +71,17 @@ Issue (1) ──< (many) Evidence
 - Team/project sharing fields on Audit (no multi-user ownership in MVP)
 - `comparison_id` on Issue (no comparison feature yet)
 - Any responsive/breakpoint dimension on AuditCapture (single-viewport capture only in MVP)
+
+## 6. Implementation Status (Task 6.2)
+
+The actual schema and migrations in PostgreSQL determine the current database state:
+
+| Entity | Status | Migration / Notes |
+|---|---|---|
+| **User** | Implemented | `users` table (`20261021235658_init_auth`) |
+| **Audit** | Implemented | `audits` table (`20261022093000_create_audits`, `20261022104500_set_audits_id_default`) |
+| **Issue** | Implemented | `issues` table (`20261023020000_create_issues_and_evidence`). Enums: `issue_category`, `issue_severity`, `issue_confidence`, `issue_status`. |
+| **Evidence** | Implemented | `evidence` table (`20261023020000_create_issues_and_evidence`). `screenshot_crop_url` is nullable and kept `null` until visual cropping is implemented; `highlighted_region` stores nullable JSONB `{ x, y, width, height }`. |
+| **AuditCapture** | Deferred | Captured DOM, styles, and screenshot are processed transiently in-memory during worker pipeline; persistent table deferred to Phase 2. |
+| **Report** | Deferred | Results queried dynamically from `Issue` records in MVP; denormalized summary cache table deferred. |
+| **Job** | Deferred | Stage transitions managed in memory by `AuditOrchestratorService` and BullMQ job state. |

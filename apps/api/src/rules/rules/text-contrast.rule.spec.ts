@@ -139,7 +139,7 @@ describe('TextContrastRule', () => {
     });
 
     expect(result.status).toBe(RuleEvaluationStatus.NOT_EVALUABLE);
-    expect(result.notEvaluableReason).toContain('Effective background color cannot be deterministically resolved');
+    expect(result.notEvaluableReason).toContain('Effective background or foreground color cannot be deterministically resolved');
   });
 
   it('returns not-evaluable when no computed styles are provided', () => {

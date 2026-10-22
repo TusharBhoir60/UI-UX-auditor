@@ -24,12 +24,24 @@ describe('ButtonNamePresentRule', () => {
     expect(result.elementsEvaluatedCount).toBe(1);
   });
 
-  it('passes when icon button has aria-label or aria-labelledby or title', () => {
+  it('passes when icon button has aria-label', () => {
+    const html = '<html><body><button aria-label="Close dialog"><svg></svg></button></body></html>';
+    const parsedDom = extractDomEvidence(html);
+    const result = rule.evaluate({
+      parsedDom,
+      computedStyles: [],
+      rawHtml: html,
+    });
+
+    expect(result.status).toBe(RuleEvaluationStatus.PASS);
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it('passes when aria-labelledby resolves to an existing element with non-empty text', () => {
     const html = `
       <html><body>
-        <button aria-label="Close dialog"><svg></svg></button>
-        <button aria-labelledby="label-id"><svg></svg></button>
-        <button title="Settings"><svg></svg></button>
+        <span id="label-save">Save Changes</span>
+        <button aria-labelledby="label-save"><svg></svg></button>
       </body></html>
     `;
     const parsedDom = extractDomEvidence(html);
@@ -41,7 +53,68 @@ describe('ButtonNamePresentRule', () => {
 
     expect(result.status).toBe(RuleEvaluationStatus.PASS);
     expect(result.findings).toHaveLength(0);
-    expect(result.elementsEvaluatedCount).toBe(3);
+  });
+
+  it('flags Critical finding when aria-labelledby references a non-existent element', () => {
+    const html = '<html><body><button aria-labelledby="non-existent-id"><svg></svg></button></body></html>';
+    const parsedDom = extractDomEvidence(html);
+    const result = rule.evaluate({
+      parsedDom,
+      computedStyles: [],
+      rawHtml: html,
+    });
+
+    expect(result.status).toBe(RuleEvaluationStatus.FINDING);
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].title).toBe('Button aria-labelledby reference cannot be resolved');
+    expect(result.findings[0].evidence.observed).toContain('missing element(s): #non-existent-id');
+  });
+
+  it('flags Critical finding when aria-labelledby references an element with empty text', () => {
+    const html = `
+      <html><body>
+        <span id="empty-label">   </span>
+        <button aria-labelledby="empty-label"><svg></svg></button>
+      </body></html>
+    `;
+    const parsedDom = extractDomEvidence(html);
+    const result = rule.evaluate({
+      parsedDom,
+      computedStyles: [],
+      rawHtml: html,
+    });
+
+    expect(result.status).toBe(RuleEvaluationStatus.FINDING);
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].title).toBe('Button aria-labelledby reference cannot be resolved');
+    expect(result.findings[0].evidence.observed).toContain('empty text: #empty-label');
+  });
+
+  it('passes when title attribute provides non-empty fallback accessible name', () => {
+    const html = '<html><body><button title="Settings"><svg></svg></button></body></html>';
+    const parsedDom = extractDomEvidence(html);
+    const result = rule.evaluate({
+      parsedDom,
+      computedStyles: [],
+      rawHtml: html,
+    });
+
+    expect(result.status).toBe(RuleEvaluationStatus.PASS);
+    expect(result.findings).toHaveLength(0);
+  });
+
+  it('flags Critical finding when title attribute is whitespace only', () => {
+    const html = '<html><body><button title="   "><svg></svg></button></body></html>';
+    const parsedDom = extractDomEvidence(html);
+    const result = rule.evaluate({
+      parsedDom,
+      computedStyles: [],
+      rawHtml: html,
+    });
+
+    expect(result.status).toBe(RuleEvaluationStatus.FINDING);
+    expect(result.findings).toHaveLength(1);
+    expect(result.findings[0].title).toBe('Button lacks an accessible name');
   });
 
   it('skips hidden buttons with aria-hidden="true"', () => {

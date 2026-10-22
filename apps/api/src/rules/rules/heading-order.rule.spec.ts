@@ -60,7 +60,7 @@ describe('HeadingOrderRule', () => {
 
     expect(result.status).toBe(RuleEvaluationStatus.FINDING);
     expect(result.findings).toHaveLength(1);
-    expect(result.findings[0].title).toBe('Document lacks a top-level <h1> heading');
+    expect(result.findings[0].title).toBe('Document lacks a top-level <h1> heading (structural navigation)');
     expect(result.findings[0].severity).toBe(RuleSeverity.MEDIUM);
   });
 
@@ -80,8 +80,9 @@ describe('HeadingOrderRule', () => {
 
     expect(result.status).toBe(RuleEvaluationStatus.FINDING);
     expect(result.findings).toHaveLength(1);
-    expect(result.findings[0].title).toBe('Heading level skipped: <h1> to <h3>');
-    expect(result.findings[0].evidence.expected).toBe('Heading level <= <h2>');
+    expect(result.findings[0].title).toBe('Heading level skipped (structural hierarchy): <h1> to <h3>');
+    expect(result.findings[0].severity).toBe(RuleSeverity.LOW);
+    expect(result.findings[0].evidence.expected).toBe('Sequential heading level <= <h2>');
     expect(result.findings[0].evidence.observed).toBe('<h3> (skipped from <h1>)');
   });
 
@@ -101,7 +102,8 @@ describe('HeadingOrderRule', () => {
 
     expect(result.status).toBe(RuleEvaluationStatus.FINDING);
     expect(result.findings).toHaveLength(1);
-    expect(result.findings[0].title).toBe('Empty heading element <h2>');
+    expect(result.findings[0].title).toBe('Empty heading element <h2> (accessibility barrier)');
+    expect(result.findings[0].severity).toBe(RuleSeverity.MEDIUM);
   });
 
   it('returns not-evaluable when DOM snapshot is empty or malformed', () => {

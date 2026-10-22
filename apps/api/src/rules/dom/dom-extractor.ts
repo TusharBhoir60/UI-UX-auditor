@@ -58,6 +58,7 @@ export interface ParsedDomDocument {
   images: ParsedImageElement[];
   buttons: ParsedButtonElement[];
   headings: ParsedHeadingElement[];
+  documentIds: Map<string, string>;
   isMalformed: boolean;
   parsingErrors: string[];
 }
@@ -65,7 +66,7 @@ export interface ParsedDomDocument {
 /**
  * Decodes standard HTML entities into plain text.
  */
-function decodeHtmlEntities(text: string): string {
+export function decodeHtmlEntities(text: string): string {
   if (!text) return '';
   return text
     .replace(/&amp;/g, '&')
@@ -79,7 +80,7 @@ function decodeHtmlEntities(text: string): string {
 /**
  * Parses raw HTML attribute string into a key-value record.
  */
-function parseAttributes(rawAttrs: string): Record<string, string> {
+export function parseAttributes(rawAttrs: string): Record<string, string> {
   const attrs: Record<string, string> = {};
   if (!rawAttrs) return attrs;
 
@@ -99,7 +100,7 @@ function parseAttributes(rawAttrs: string): Record<string, string> {
 /**
  * Extracts plain text from an HTML snippet by stripping all nested tags.
  */
-function stripHtmlTags(html: string): string {
+export function stripHtmlTags(html: string): string {
   if (!html) return '';
   return decodeHtmlEntities(html.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
 }
@@ -107,12 +108,19 @@ function stripHtmlTags(html: string): string {
 /**
  * Generates a stable CSS selector matching the convention in CaptureService.
  */
-function buildSelector(tagName: string, id?: string, classList?: string[]): string {
+function buildSelector(
+  tagName: string,
+  id: string | undefined,
+  classList: string[] | undefined,
+  occurrenceIndex: number,
+): string {
   let sel = tagName.toLowerCase();
   if (id) {
     sel += `#${id}`;
   } else if (classList && classList.length > 0) {
     sel += `.${classList.slice(0, 3).join('.')}`;
+  } else {
+    sel += `:nth-of-type(${occurrenceIndex})`;
   }
   return sel;
 }
@@ -180,6 +188,7 @@ export function extractDomEvidence(
     images: [],
     buttons: [],
     headings: [],
+    documentIds: new Map<string, string>(),
     isMalformed: false,
     parsingErrors: [],
   };
@@ -210,7 +219,24 @@ export function extractDomEvidence(
     }
   }
 
-  // 3. Extract <img> elements (void / self-closing)
+  // 3. Scan all elements with id="..." to build a document ID registry for accessible reference resolution
+  const idRegex = /<([a-zA-Z0-9_:-]+)\b([^>]*\bid\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))[^>]*)>(?:([\s\S]*?)<\/\1>)?/gi;
+  let idMatch: RegExpExecArray | null;
+  let idCount = 0;
+
+  while (
+    (idMatch = idRegex.exec(cleanedHtml)) !== null &&
+    idCount < RULE_CONSTANTS.MAX_DOM_SCAN_ELEMENTS
+  ) {
+    idCount++;
+    const elementId = idMatch[3] ?? idMatch[4] ?? idMatch[5];
+    if (elementId) {
+      const innerText = idMatch[6] ? stripHtmlTags(idMatch[6]) : '';
+      result.documentIds.set(elementId, innerText);
+    }
+  }
+
+  // 4. Extract <img> elements (void / self-closing)
   const imgRegex = /<img\b([^>]*)>/gi;
   let imgMatch: RegExpExecArray | null;
   let imgCount = 0;
@@ -224,7 +250,7 @@ export function extractDomEvidence(
     const attrs = parseAttributes(rawAttrs);
     const id = attrs['id'];
     const classList = attrs['class'] ? attrs['class'].split(/\s+/).filter(Boolean) : [];
-    const selector = buildSelector('img', id, classList);
+    const selector = buildSelector('img', id, classList, imgCount);
 
     const hasAlt = Object.prototype.hasOwnProperty.call(attrs, 'alt');
     const matchingStyle = findMatchingStyle('img', id, classList, '', computedStyles);
@@ -244,7 +270,7 @@ export function extractDomEvidence(
     });
   }
 
-  // 4. Extract <button>...</button>
+  // 5. Extract <button>...</button>
   const buttonRegex = /<button\b([^>]*)>([\s\S]*?)<\/button>/gi;
   let btnMatch: RegExpExecArray | null;
   let btnCount = 0;
@@ -259,7 +285,7 @@ export function extractDomEvidence(
     const attrs = parseAttributes(rawAttrs);
     const id = attrs['id'];
     const classList = attrs['class'] ? attrs['class'].split(/\s+/).filter(Boolean) : [];
-    const selector = buildSelector('button', id, classList);
+    const selector = buildSelector('button', id, classList, btnCount);
     const textContent = stripHtmlTags(innerHtml);
     const matchingStyle = findMatchingStyle('button', id, classList, textContent, computedStyles);
 
@@ -279,7 +305,7 @@ export function extractDomEvidence(
     });
   }
 
-  // 5. Extract Headings <h1..h6>...</h1..h6>
+  // 6. Extract Headings <h1..h6>...</h1..h6>
   const headingRegex = /<h([1-6])\b([^>]*)>([\s\S]*?)<\/h\1>/gi;
   let hMatch: RegExpExecArray | null;
   let hCount = 0;
@@ -295,7 +321,7 @@ export function extractDomEvidence(
     const attrs = parseAttributes(rawAttrs);
     const id = attrs['id'];
     const classList = attrs['class'] ? attrs['class'].split(/\s+/).filter(Boolean) : [];
-    const selector = buildSelector(`h${level}`, id, classList);
+    const selector = buildSelector(`h${level}`, id, classList, hCount);
     const textContent = stripHtmlTags(innerHtml);
     const matchingStyle = findMatchingStyle(`h${level}`, id, classList, textContent, computedStyles);
 

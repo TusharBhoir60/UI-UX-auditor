@@ -24,7 +24,7 @@ export class TextContrastRule implements DeterministicRule {
   readonly defaultSeverity = RuleSeverity.HIGH;
   readonly standardReference = 'WCAG 1.4.3 (Level AA)';
   readonly description =
-    'Ensures text elements provide sufficient color contrast against their rendered background (minimum 4.5:1 for standard text, 3.0:1 for large text). When background color is transparent or ambiguous, reports not-evaluable to prevent false positives.';
+    'Ensures text elements provide sufficient color contrast against their rendered background (minimum 4.5:1 for standard text, 3.0:1 for large text). When background or foreground color is transparent, semi-transparent, or ambiguous, reports not-evaluable to prevent false passes or false findings.';
 
   evaluate(context: RuleEvaluationContext): RuleResult {
     const { computedStyles } = context;
@@ -60,8 +60,9 @@ export class TextContrastRule implements DeterministicRule {
       const fgColor = parseCssColor(cs.styles.color);
       const bgColor = parseCssColor(cs.styles.backgroundColor);
 
-      // Check for transparent or ambiguous background colors
-      if (!fgColor || !bgColor || bgColor.a < 0.99) {
+      // Conservative handling: never silently assume black or white if colors are unparseable,
+      // transparent, semi-transparent, or unsupported.
+      if (!fgColor || !bgColor || fgColor.a < 0.99 || bgColor.a < 0.99) {
         ambiguousCount++;
         continue;
       }
@@ -115,7 +116,8 @@ export class TextContrastRule implements DeterministicRule {
       }
     }
 
-    // If no elements had explicit opaque backgrounds, report not-evaluable instead of false pass
+    // If no elements had explicit opaque background and foreground colors,
+    // conservatively report not-evaluable rather than fabricating an arbitrary background.
     if (evaluableCount === 0) {
       return {
         ruleId: this.id,
@@ -126,7 +128,7 @@ export class TextContrastRule implements DeterministicRule {
         findings: [],
         notEvaluableReason:
           ambiguousCount > 0
-            ? 'Effective background color cannot be deterministically resolved from captured styles (transparent or inherited background detected; requires DOM parent background inheritance or screenshot pixel sampling)'
+            ? 'Effective background or foreground color cannot be deterministically resolved from captured styles (transparent, semi-transparent, inherited, or unsupported color format detected; requires parent background inheritance or screenshot pixel sampling)'
             : 'No text elements with computed styles found to evaluate',
       };
     }

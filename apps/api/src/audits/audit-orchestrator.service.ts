@@ -2,6 +2,8 @@ import { Injectable, Logger } from '@nestjs/common';
 import { PrismaService } from '../database/prisma.service';
 import { CaptureService } from '../capture/capture.service';
 import { CaptureError, sanitizeErrorMessage } from '../capture/capture.types';
+import { RuleEngineService } from '../rules/rule-engine.service';
+import { AuditFindingsService } from './audit-findings.service';
 import {
   AuditOrchestrationError,
   AuditOrchestrationErrorCode,
@@ -17,18 +19,21 @@ export class AuditOrchestratorService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly captureService: CaptureService,
+    private readonly ruleEngineService: RuleEngineService,
+    private readonly auditFindingsService: AuditFindingsService,
   ) {}
 
   /**
    * Transitions an existing queued audit to running, executes headless browser capture,
-   * and records the terminal state (complete or failed).
+   * evaluates deterministic rules, persists evidence-grounded findings, and records terminal state.
    *
    * TRANSACTION BOUNDARY & CONCURRENCY GUARANTEES:
    * 1. State transitions are guarded by atomic conditional SQL updates (updateMany where status = 'queued').
-   * 2. Database connections and transactions are NEVER held open while Chromium runs.
-   * 3. Terminal state updates (to complete or failed) conditionally target status = 'running',
+   * 2. Database connections and transactions are NEVER held open while Chromium or rules run.
+   * 3. Deterministic findings are persisted transactionally before marking audit complete.
+   * 4. Terminal state updates (to complete or failed) conditionally target status = 'running',
    *    ensuring late failure callbacks cannot overwrite a completed audit.
-   * 4. URLs are loaded strictly from the database record; untrusted caller URLs are never used.
+   * 5. URLs are loaded strictly from the database record; untrusted caller URLs are never used.
    */
   async processAudit(auditId: string): Promise<AuditOrchestrationResult> {
     // 1. Load the audit from the database
@@ -93,7 +98,48 @@ export class AuditOrchestratorService {
       return await this.handleCaptureFailure(auditId, err);
     }
 
-    // 5. Record terminal success
+    // 5. Evaluate deterministic rules against captured evidence
+    let ruleEngineResult;
+    try {
+      ruleEngineResult = await this.ruleEngineService.evaluate({
+        domSnapshot: captureResult.domSnapshot,
+        computedStyles: captureResult.computedStyles,
+        url: captureResult.validatedDestination?.normalizedUrl ?? audit.url,
+      });
+
+      this.logger.log(
+        `[Rule Evaluation Succeeded] auditId=${auditId} durationMs=${ruleEngineResult.durationMs} rules=${ruleEngineResult.rulesEvaluatedCount} findings=${ruleEngineResult.totalFindingsCount}`,
+      );
+    } catch (ruleErr) {
+      const safeReason =
+        ruleErr instanceof Error ? ruleErr.message : 'Rule evaluation failed';
+      this.logger.error(`[Rule Evaluation Failed] auditId=${auditId}: ${safeReason}`);
+      return await this.handleTerminalFailure(
+        auditId,
+        `Rule evaluation failed: ${safeReason}`,
+      );
+    }
+
+    // 6. Persist deterministic findings atomically
+    let findingsCount = 0;
+    try {
+      findingsCount = await this.auditFindingsService.persistFindings(
+        auditId,
+        ruleEngineResult.findings,
+      );
+
+      this.logger.log(
+        `[Findings Persisted] auditId=${auditId} count=${findingsCount}`,
+      );
+    } catch (persistErr) {
+      this.logger.error(`[Findings Persistence Failed] auditId=${auditId}`);
+      return await this.handleTerminalFailure(
+        auditId,
+        'Failed to persist audit findings',
+      );
+    }
+
+    // 7. Record terminal success
     try {
       const updateResult = await this.prisma.audit.updateMany({
         where: {
@@ -117,6 +163,7 @@ export class AuditOrchestratorService {
         auditId,
         status: 'complete',
         captureMetadata: captureResult.metadata,
+        findingsCount,
       };
     } catch (dbErr) {
       this.logger.error(`Failed to persist complete status for audit ${auditId}`);
@@ -137,7 +184,16 @@ export class AuditOrchestratorService {
     err: unknown,
   ): Promise<AuditOrchestrationFailure> {
     const safeReason = this.mapToSafeFailureReason(err);
+    return this.handleTerminalFailure(auditId, safeReason);
+  }
 
+  /**
+   * Conditionally transitions a running audit to 'failed' with a sanitized reason.
+   */
+  private async handleTerminalFailure(
+    auditId: string,
+    safeReason: string,
+  ): Promise<AuditOrchestrationFailure> {
     try {
       const updateResult = await this.prisma.audit.updateMany({
         where: {

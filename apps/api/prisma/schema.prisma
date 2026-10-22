@@ -29,7 +29,7 @@ model User {
 }
 
 model Audit {
-  id            String      @id @default(uuid()) @db.Uuid
+  id            String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   userId        String      @map("user_id") @db.Uuid
   url           String      @db.VarChar(2048)
   status        AuditStatus @default(queued)
@@ -39,7 +39,79 @@ model Audit {
 
   user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  issues        Issue[]
+
   @@index([userId])
   @@index([userId, createdAt(sort: Desc)])
   @@map("audits")
+}
+
+enum IssueCategory {
+  accessibility
+  visual
+  usability
+
+  @@map("issue_category")
+}
+
+enum IssueSeverity {
+  Critical
+  High
+  Medium
+  Low
+
+  @@map("issue_severity")
+}
+
+enum IssueConfidence {
+  deterministic
+  high
+  medium
+  low
+
+  @@map("issue_confidence")
+}
+
+enum IssueStatus {
+  open
+  acknowledged
+  fixed
+
+  @@map("issue_status")
+}
+
+model Issue {
+  id                String          @id @default(uuid()) @db.Uuid
+  auditId           String          @map("audit_id") @db.Uuid
+  category          IssueCategory
+  title             String          @db.VarChar(255)
+  description       String          @db.Text
+  severity          IssueSeverity
+  confidence        IssueConfidence @default(deterministic)
+  standardReference String?         @map("standard_reference") @db.VarChar(255)
+  recommendation    String          @db.Text
+  status            IssueStatus     @default(open)
+  createdAt         DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  audit             Audit           @relation(fields: [auditId], references: [id], onDelete: Cascade)
+  evidence          Evidence[]
+
+  @@index([auditId])
+  @@index([auditId, severity])
+  @@map("issues")
+}
+
+model Evidence {
+  id                String   @id @default(uuid()) @db.Uuid
+  issueId           String   @map("issue_id") @db.Uuid
+  domSelector       String?  @map("dom_selector") @db.VarChar(1024)
+  highlightedRegion Json?    @map("highlighted_region")
+  screenshotCropUrl String?  @map("screenshot_crop_url") @db.VarChar(2048)
+  snippet           String?  @db.Text
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  issue             Issue    @relation(fields: [issueId], references: [id], onDelete: Cascade)
+
+  @@index([issueId])
+  @@map("evidence")
 }
