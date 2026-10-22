@@ -2,6 +2,7 @@ import { Test, TestingModule } from '@nestjs/testing';
 import { InternalServerErrorException, NotFoundException } from '@nestjs/common';
 import { AuditsService } from './audits.service';
 import { PrismaService } from '../database/prisma.service';
+import { AuditQueueService } from '../queue/audit-queue.service';
 
 describe('AuditsService', () => {
   let service: AuditsService;
@@ -10,7 +11,11 @@ describe('AuditsService', () => {
       create: jest.Mock;
       findMany: jest.Mock;
       findFirst: jest.Mock;
+      updateMany: jest.Mock;
     };
+  };
+  let mockAuditQueueService: {
+    addAuditJob: jest.Mock;
   };
 
   const USER_ID = '11111111-1111-4111-8111-111111111111';
@@ -23,7 +28,12 @@ describe('AuditsService', () => {
         create: jest.fn(),
         findMany: jest.fn(),
         findFirst: jest.fn(),
+        updateMany: jest.fn(),
       },
+    };
+
+    mockAuditQueueService = {
+      addAuditJob: jest.fn().mockResolvedValue(undefined),
     };
 
     const module: TestingModule = await Test.createTestingModule({
@@ -33,6 +43,10 @@ describe('AuditsService', () => {
           provide: PrismaService,
           useValue: mockPrismaService,
         },
+        {
+          provide: AuditQueueService,
+          useValue: mockAuditQueueService,
+        },
       ],
     }).compile();
 
@@ -40,7 +54,7 @@ describe('AuditsService', () => {
   });
 
   describe('create', () => {
-    it('creates an audit record with initial status "queued" and returns audit_id and status', async () => {
+    it('creates an audit record with initial status "queued", enqueues the job, and returns audit_id and status', async () => {
       mockPrismaService.audit.create.mockResolvedValueOnce({
         id: AUDIT_ID,
         status: 'queued',
@@ -61,6 +75,8 @@ describe('AuditsService', () => {
           status: true,
         },
       });
+
+      expect(mockAuditQueueService.addAuditJob).toHaveBeenCalledWith(AUDIT_ID);
 
       expect(result).toEqual({
         audit_id: AUDIT_ID,
@@ -85,7 +101,7 @@ describe('AuditsService', () => {
       );
     });
 
-    it('handles persistence errors safely without exposing internal database details', async () => {
+    it('handles persistence errors safely without exposing internal database details or calling queue', async () => {
       mockPrismaService.audit.create.mockRejectedValueOnce(
         new Error('FATAL: connection to PostgreSQL server lost (sensitive connection details)'),
       );
@@ -93,6 +109,56 @@ describe('AuditsService', () => {
       await expect(
         service.create(USER_ID, { url: 'https://example.com' }),
       ).rejects.toThrow(new InternalServerErrorException('Failed to create audit'));
+
+      expect(mockAuditQueueService.addAuditJob).not.toHaveBeenCalled();
+    });
+
+    it('marks audit as failed with observable failure reason and throws 500 when queue enqueue fails', async () => {
+      mockPrismaService.audit.create.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        status: 'queued',
+      });
+      mockAuditQueueService.addAuditJob.mockRejectedValueOnce(
+        new Error('Redis connection timed out at 10.0.0.1:6379 with auth pass=secret'),
+      );
+      mockPrismaService.audit.updateMany.mockResolvedValueOnce({ count: 1 });
+
+      await expect(
+        service.create(USER_ID, { url: 'https://example.com' }),
+      ).rejects.toThrow(
+        new InternalServerErrorException('Failed to enqueue audit for processing'),
+      );
+
+      expect(mockPrismaService.audit.updateMany).toHaveBeenCalledWith({
+        where: {
+          id: AUDIT_ID,
+          status: 'queued',
+        },
+        data: {
+          status: 'failed',
+          failureReason: 'Failed to enqueue audit for processing',
+          completedAt: expect.any(Date),
+        },
+      });
+    });
+
+    it('still throws InternalServerErrorException even if the compensating database update fails', async () => {
+      mockPrismaService.audit.create.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        status: 'queued',
+      });
+      mockAuditQueueService.addAuditJob.mockRejectedValueOnce(
+        new Error('Redis down'),
+      );
+      mockPrismaService.audit.updateMany.mockRejectedValueOnce(
+        new Error('Database disconnected during compensation'),
+      );
+
+      await expect(
+        service.create(USER_ID, { url: 'https://example.com' }),
+      ).rejects.toThrow(
+        new InternalServerErrorException('Failed to enqueue audit for processing'),
+      );
     });
   });
 

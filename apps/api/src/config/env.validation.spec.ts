@@ -193,4 +193,80 @@ describe('validateEnv', () => {
       );
     });
   });
+
+  describe('Redis configuration validation', () => {
+    it('defaults Redis configuration when omitted', () => {
+      const validated = validateEnv(validConfig);
+      expect(validated.REDIS_HOST).toBe('localhost');
+      expect(validated.REDIS_PORT).toBe(6379);
+      expect(validated.REDIS_PASSWORD).toBeUndefined();
+      expect(validated.REDIS_TLS).toBe(false);
+    });
+
+    it('accepts valid custom Redis configuration', () => {
+      const config = {
+        ...validConfig,
+        REDIS_HOST: 'redis.internal',
+        REDIS_PORT: '6380',
+        REDIS_PASSWORD: 'redis-super-secret-password',
+        REDIS_TLS: 'true',
+      };
+      const validated = validateEnv(config);
+      expect(validated.REDIS_HOST).toBe('redis.internal');
+      expect(validated.REDIS_PORT).toBe(6380);
+      expect(validated.REDIS_PASSWORD).toBe('redis-super-secret-password');
+      expect(validated.REDIS_TLS).toBe(true);
+    });
+
+    it('handles numeric REDIS_PORT and boolean REDIS_TLS', () => {
+      const config = {
+        ...validConfig,
+        REDIS_PORT: 6381,
+        REDIS_TLS: true,
+      };
+      const validated = validateEnv(config);
+      expect(validated.REDIS_PORT).toBe(6381);
+      expect(validated.REDIS_TLS).toBe(true);
+    });
+
+    it('rejects non-numeric REDIS_PORT', () => {
+      const config = { ...validConfig, REDIS_PORT: 'abc' };
+      expect(() => validateEnv(config)).toThrow(
+        /REDIS_PORT must be an integer between 1 and 65535/,
+      );
+    });
+
+    it('rejects out-of-range REDIS_PORT', () => {
+      expect(() => validateEnv({ ...validConfig, REDIS_PORT: 0 })).toThrow(
+        /REDIS_PORT must be an integer between 1 and 65535/,
+      );
+      expect(() => validateEnv({ ...validConfig, REDIS_PORT: 70000 })).toThrow(
+        /REDIS_PORT must be an integer between 1 and 65535/,
+      );
+    });
+
+    it('rejects invalid REDIS_TLS value', () => {
+      const config = { ...validConfig, REDIS_TLS: 'invalid-bool' };
+      expect(() => validateEnv(config)).toThrow(
+        /REDIS_TLS must be a boolean/,
+      );
+    });
+
+    it('never leaks REDIS_PASSWORD in validation errors', () => {
+      const secretPassword = 'super-confidential-redis-password';
+      const config = {
+        ...validConfig,
+        REDIS_PORT: 'invalid-port',
+        REDIS_PASSWORD: secretPassword,
+      };
+
+      try {
+        validateEnv(config);
+        fail('Expected validateEnv to throw');
+      } catch (err: unknown) {
+        const message = (err as Error).message;
+        expect(message).not.toContain(secretPassword);
+      }
+    });
+  });
 });

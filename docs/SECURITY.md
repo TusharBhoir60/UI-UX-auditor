@@ -103,7 +103,29 @@ Each audit consumes real cost (headless browser compute + AI API calls), so this
 - Captured screenshots and DOM snapshots of third-party websites are stored per-audit; retention policy should be defined (even a simple "kept indefinitely, deletable by the owning user" is acceptable for MVP, but must be a conscious decision, not an oversight).
 - No captured data is shared across users; Object Storage paths should be non-guessable (random IDs, not sequential) even though access is also enforced at the API layer — defense in depth.
 
-## 8. Explicitly Deferred (Phase 2+, but noted here for awareness)
+## 8. Job Queue & Asynchronous Processing Security (BullMQ + Redis)
+
+The introduction of asynchronous background workers creates additional trust boundaries and infrastructure components that must be secured:
+
+- **Queue Payload Isolation:**
+  - Queue payloads carry strictly minimal, non-sensitive metadata: `{ auditId: string }`.
+  - Raw URLs, user-supplied headers, session tokens, or credentials are strictly excluded from queue payloads.
+  - The worker strictly resolves the authoritative target URL directly from PostgreSQL by audit ID, preventing queue-level injection or URL tampering.
+- **Error Sanitization & Secret Redaction:**
+  - All worker error handlers and queue event handlers sanitize error messages via `sanitizeErrorMessage`.
+  - Credentials (`user:pass@host`), database connection strings, raw target URLs, DOM snapshots, screenshots, or stack traces containing secrets are never logged to console or queue event logs.
+- **No Public Queue Endpoints:**
+  - Neither BullMQ UI, Redis administrative commands, nor internal queue management endpoints are exposed via public HTTP controllers.
+- **Redis Infrastructure Security:**
+  - Validated environment configuration enforces strong connection handling with optional authentication (`REDIS_PASSWORD`) and TLS encryption (`REDIS_TLS`).
+  - Redis connection credentials are never included in error messages or environment validation logs.
+  - Production deployments require Redis to run within an isolated internal subnet with strict firewalling, disallowing direct ingress from external untrusted networks or browser sandboxes.
+- **Atomic State Transitions & Safe Duplicate Delivery:**
+  - Workers rely strictly on atomic conditional state transitions in PostgreSQL (`updateMany where status = 'queued'`) to claim execution authority.
+  - Duplicate deliveries or retries for already running or completed audits are safely acknowledged without overwriting state or re-executing captures.
+  - Enqueue failures trigger compensating updates marking the audit as `failed`, ensuring jobs are never left silently stranded.
+
+## 9. Explicitly Deferred (Phase 2+, but noted here for awareness)
 
 - Multi-tenant data isolation beyond per-user (relevant once team accounts exist — Phase 3)
 - Public shareable report links will need their own token-based access model with expiry — not designed yet, since the feature itself is Phase 2

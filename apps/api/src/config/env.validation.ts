@@ -6,6 +6,10 @@ export interface EnvConfig {
   NODE_ENV: 'development' | 'test' | 'production';
   API_PORT: number;
   WEB_ORIGIN: string;
+  REDIS_HOST: string;
+  REDIS_PORT: number;
+  REDIS_PASSWORD?: string;
+  REDIS_TLS?: boolean;
 }
 
 const KNOWN_INSECURE_PLACEHOLDERS = new Set([
@@ -135,6 +139,52 @@ export function validateEnv(config: Record<string, unknown>): EnvConfig {
     webOrigin = rawOrigin.trim();
   }
 
+  // 8. REDIS_HOST
+  const rawRedisHost = config.REDIS_HOST;
+  let redisHost = 'localhost';
+  if (rawRedisHost !== undefined && rawRedisHost !== null && rawRedisHost !== '') {
+    const trimmed = String(rawRedisHost).trim();
+    if (trimmed.length > 0) {
+      redisHost = trimmed;
+    }
+  }
+
+  // 9. REDIS_PORT
+  const rawRedisPort = config.REDIS_PORT;
+  let redisPort = 6379;
+  if (rawRedisPort !== undefined && rawRedisPort !== null && rawRedisPort !== '') {
+    const parsedRedisPort = Number(rawRedisPort);
+    if (Number.isInteger(parsedRedisPort) && parsedRedisPort >= 1 && parsedRedisPort <= 65535) {
+      redisPort = parsedRedisPort;
+    } else {
+      errors.push('REDIS_PORT must be an integer between 1 and 65535.');
+    }
+  }
+
+  // 10. REDIS_PASSWORD
+  const rawRedisPassword = config.REDIS_PASSWORD;
+  let redisPassword: string | undefined = undefined;
+  if (rawRedisPassword !== undefined && rawRedisPassword !== null && rawRedisPassword !== '') {
+    const trimmed = String(rawRedisPassword).trim();
+    if (trimmed.length > 0) {
+      redisPassword = trimmed;
+    }
+  }
+
+  // 11. REDIS_TLS
+  const rawRedisTls = config.REDIS_TLS;
+  let redisTls = false;
+  if (rawRedisTls !== undefined && rawRedisTls !== null && rawRedisTls !== '') {
+    const stringVal = String(rawRedisTls).trim().toLowerCase();
+    if (stringVal === 'true' || stringVal === '1') {
+      redisTls = true;
+    } else if (stringVal === 'false' || stringVal === '0') {
+      redisTls = false;
+    } else {
+      errors.push("REDIS_TLS must be a boolean ('true' or 'false').");
+    }
+  }
+
   if (errors.length > 0) {
     throw new Error(`Environment validation failed:\n  - ${errors.join('\n  - ')}`);
   }
@@ -147,5 +197,9 @@ export function validateEnv(config: Record<string, unknown>): EnvConfig {
     NODE_ENV: nodeEnv,
     API_PORT: apiPort,
     WEB_ORIGIN: webOrigin,
+    REDIS_HOST: redisHost,
+    REDIS_PORT: redisPort,
+    REDIS_PASSWORD: redisPassword,
+    REDIS_TLS: redisTls,
   };
 }
