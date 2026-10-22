@@ -7,27 +7,56 @@ This document expands the security requirements introduced in the TRD. All items
 
 ---
 
-## 1. SSRF Protection (Critical)
+## 1. SSRF Protection & Network Isolation (Critical)
 
-The Capture Module fetches whatever URL a user submits. Without controls, this lets a user point the server at internal infrastructure.
+The Capture Module fetches arbitrary user-submitted URLs server-side. Without controls, an attacker can use the headless browser to access internal infrastructure, cloud metadata endpoints, or adjacent container services.
 
-**Required controls:**
-- Resolve the submitted URL's hostname and reject requests to:
-  - Private IP ranges (RFC 1918: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
-  - Loopback (`127.0.0.0/8`, `::1`)
-  - Link-local addresses (`169.254.0.0/16`) — this specifically blocks cloud metadata endpoints (e.g. `169.254.169.254`)
-  - Any internal DNS names resolvable only inside the deployment network
-- Re-validate on every redirect the headless browser follows (DNS rebinding protection) — validating only the initially submitted URL is not sufficient, since a page can redirect to an internal address after the initial check passes.
-- Enforce an allowlist of schemes (`http`, `https` only — no `file://`, `ftp://`, etc.)
+### Application-Level Controls
+Application-level controls act as an initial defense-in-depth gatekeeper before and during browser automation:
+- **Pre-navigation URL & Destination Validation (`DestinationGuardService`):**
+  - Syntactic validation, length checks (<= 2048 chars), and control-character rejection.
+  - Rejection of embedded credentials (`user:pass@host`).
+  - Strict scheme allowlist: `http:` and `https:` only for navigation.
+  - Normalization of hostname and classification of IP literals (unicast only; IPv6 restricted to global unicast `2000::/3`).
+  - System DNS resolution checking all returned A and AAAA records against prohibited CIDRs (RFC 1918, RFC 3927 link-local, loopback, carrier-grade NAT, unique local, etc.).
+- **In-Flight Request Interception (`CaptureService` & `page.route`):**
+  - Every outbound request (navigation, redirects, and subresources) is intercepted and paused before Chromium opens a network socket.
+  - Scheme enforcement: Navigation requests are strictly `http:` or `https:`. Subresources allow inline `data:image/` and `data:font/` assets only. Prohibits `file:`, `blob:`, `javascript:`, `about:`, `ws:`, `wss:`, and `ftp:`.
+  - Redirect tracking & limit enforcement: Redirects are counted at the request level via `req.redirectedFrom()`. Requests exceeding `policy.maxRedirects` are aborted via `route.abort('blockedbyclient')` and terminate the page.
+  - Intermediate redirect validation: HTTP 3xx `Location` targets are resolved and validated via `DestinationGuardService` before Chromium can follow them.
+  - Subresource DNS check budget & deduplication: Distinct hostnames are validated up to `MAX_SUBRESOURCE_DNS_CHECKS` (50). Concurrently requested identical hostnames are deduplicated using a shared promise cache. Exceeded budgets or DNS timeouts (> 2,000ms) fail closed.
 
-## 2. Sandboxing
+### Deployment-Level Controls (Mandatory for Production)
+> **CRITICAL SECURITY REQUIREMENT & LIMITATION:**
+> Application-layer validation (`DestinationGuardService`) and Playwright routing (`page.route()`) **CANNOT** guarantee protection against DNS rebinding or time-of-check/time-of-use (TOCTOU) attacks because Chromium maintains its own internal DNS cache and socket pool independent of Node.js. An attacker controlling an authoritative nameserver can serve a public IP during Node.js validation and an internal IP (e.g., `127.0.0.1` or `169.254.169.254`) when Chromium establishes the TCP socket.
+>
+> **The service CANNOT be claimed as production-safe until the following deployment-level controls are in place and verified:**
+> 1. **Network Namespace Egress Firewalling:** Dedicated container network namespace with egress rules (e.g., iptables/nftables) dropping all outbound traffic to:
+>    - RFC 1918 private subnets: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+>    - Link-local and cloud metadata: `169.254.0.0/16`, `fe80::/10` (specifically blocking `169.254.169.254`)
+>    - Loopback: `127.0.0.0/8`, `::1`
+>    - Internal database and cache segments (PostgreSQL, Redis)
+> 2. **Dedicated Capture Worker Isolation:** Headless browser workers must run on separate compute nodes or ephemeral containers isolated from application API servers.
+> 3. **OS-Level Cgroups & Resource Limits:** Hard kernel-enforced limits on CPU (`--cpus=1.0`) and memory (`--memory=1g --memory-swap=1g`) per worker container.
+> 4. **Reliable Worker Process Termination:** Ephemeral container restarts upon timeout rather than relying purely on in-process `browser.close()` calls.
 
-The headless browser (Playwright) executes arbitrary, untrusted third-party JavaScript by design (that's the page being audited).
+## 2. Sandboxing & Resource Lifecycle
 
-**Required controls:**
-- Run the browser process in an isolated container/sandbox with no access to the internal network segment where PostgreSQL, Redis, or other backend services live.
-- Apply resource limits (CPU, memory, execution time) per capture job to prevent a malicious or pathological page from exhausting worker resources.
-- Disable or restrict browser features not needed for capture (e.g., file downloads, clipboard access, geolocation prompts).
+The headless browser (Playwright) executes untrusted third-party HTML, CSS, and JavaScript.
+
+### Application-Level Controls
+- Chromium sandbox kept strictly ENABLED (no `--no-sandbox` flag).
+- Hard overall timeout (`policy.overallTimeoutMs`, default 30s) bounding the entire capture execution.
+- Idempotent and bounded resource cleanup (`RESOURCE_CLEANUP_TIMEOUT_MS = 2,000ms`) ensuring hung `page.close()`, `context.close()`, or `browser.close()` calls cannot hang the worker.
+- Cancellation guards (`isCancelled`) to immediately terminate late-launched browser processes.
+- Artifact boundary enforcement:
+  - Traversal bounded to `policy.maxDomElements` (1,000) during computed styles extraction.
+  - Post-generation size bounds on screenshot (10 MB) and DOM snapshot (5 MB) preventing oversized payloads from propagating downstream.
+- Restricted browser context: `acceptDownloads: false`, `serviceWorkers: 'block'`, dialogs auto-dismissed, popups auto-closed.
+
+### Deployment-Level Controls
+- Post-generation artifact size checks do NOT prevent in-process memory allocation during rendering. Pathological pages (e.g. DOM bombs with 500,000 elements) require container memory ceilings (cgroups) to prevent worker host OOM.
+
 
 ## 3. Prompt Injection Resistance
 
