@@ -18,9 +18,14 @@ import {
   CaptureRequest,
   CaptureResult,
   ElementComputedStyle,
+  sanitizeErrorMessage,
 } from './capture.types';
 import { DestinationGuardService } from './destination-guard.service';
-import { DestinationGuardError, ValidatedDestination } from './destination-guard.types';
+import {
+  DestinationErrorCode,
+  DestinationGuardError,
+  ValidatedDestination,
+} from './destination-guard.types';
 
 /**
  * Hostnames and patterns blocked for all in-flight subresources.
@@ -97,6 +102,16 @@ async function closeWithTimeout(
  * and an internal IP (e.g., 127.0.0.1 or 169.254.169.254) for the browser's socket connection.
  * Production deployments REQUIRE kernel/container network namespace egress isolation
  * (e.g. iptables/nftables dropping packets to RFC 1918, RFC 3927 link-local, and loopback CIDRs).
+ *
+ * RESOURCE LIFECYCLE & IN-PROCESS LIMITATIONS:
+ * 1. In-process timeouts (overallTimeoutMs and navigationTimeoutMs) and bounded cleanup
+ *    (closeWithTimeout) bound the Node.js execution time, but do NOT guarantee OS-level
+ *    Chromium termination if the browser process is deadlocked or unresponsive.
+ *    Production deployments require ephemeral worker container termination.
+ * 2. Artifact size bounds (maxScreenshotSizeBytes, maxDomSnapshotSizeBytes) are enforced
+ *    post-generation before returning data downstream. They do not prevent Chromium's
+ *    in-memory allocation during initial rasterization and rendering; container cgroup memory
+ *    limits (--memory=1g) must be enforced at the host level.
  */
 @Injectable()
 export class CaptureService {
@@ -129,11 +144,20 @@ export class CaptureService {
       validatedTarget = await this.destinationGuard.validate(request.url);
     } catch (err) {
       if (err instanceof DestinationGuardError) {
-        throw new CaptureError(
-          err.code as unknown as CaptureErrorCode,
-          err.safeReason,
-          err,
-        );
+        let code: CaptureErrorCode;
+        switch (err.code) {
+          case DestinationErrorCode.BLOCKED_DESTINATION:
+            code = CaptureErrorCode.BLOCKED_DESTINATION;
+            break;
+          case DestinationErrorCode.DNS_RESOLUTION_FAILED:
+            code = CaptureErrorCode.DNS_RESOLUTION_FAILED;
+            break;
+          case DestinationErrorCode.INVALID_TARGET:
+          default:
+            code = CaptureErrorCode.INVALID_TARGET;
+            break;
+        }
+        throw new CaptureError(code, err.safeReason, err);
       }
       throw new CaptureError(
         CaptureErrorCode.INVALID_TARGET,
@@ -206,14 +230,18 @@ export class CaptureService {
       };
     });
 
+    const checkCancelled = () => {
+      if (isCancelled) {
+        throw new CaptureError(
+          CaptureErrorCode.TIMEOUT,
+          `Overall capture exceeded ${policy.overallTimeoutMs}ms timeout`,
+        );
+      }
+    };
+
     const runCapture = async (): Promise<CaptureResult> => {
       try {
-        if (isCancelled) {
-          throw new CaptureError(
-            CaptureErrorCode.TIMEOUT,
-            `Overall capture exceeded ${policy.overallTimeoutMs}ms timeout`,
-          );
-        }
+        checkCancelled();
 
         // 3. Launch browser via injected provider
         let launchedBrowser: Browser;
@@ -234,20 +262,12 @@ export class CaptureService {
             () => launchedBrowser.close(),
             RESOURCE_CLEANUP_TIMEOUT_MS,
           );
-          throw new CaptureError(
-            CaptureErrorCode.TIMEOUT,
-            `Overall capture exceeded ${policy.overallTimeoutMs}ms timeout`,
-          );
+          checkCancelled();
         }
         browser = launchedBrowser;
 
         // 4. Create isolated browser context with fixed viewport and security settings
-        if (isCancelled) {
-          throw new CaptureError(
-            CaptureErrorCode.TIMEOUT,
-            `Overall capture exceeded ${policy.overallTimeoutMs}ms timeout`,
-          );
-        }
+        checkCancelled();
 
         try {
           context = await browser.newContext({
@@ -266,12 +286,7 @@ export class CaptureService {
         }
 
         // 5. Create new page in context
-        if (isCancelled) {
-          throw new CaptureError(
-            CaptureErrorCode.TIMEOUT,
-            `Overall capture exceeded ${policy.overallTimeoutMs}ms timeout`,
-          );
-        }
+        checkCancelled();
 
         try {
           page = await context.newPage();
@@ -292,7 +307,7 @@ export class CaptureService {
         });
 
         // 6. Active redirect tracking and routing interception state
-        const countedRedirectRequests = new Set<unknown>();
+        const countedRedirectSourceRequests = new Set<unknown>();
         let redirectCount = 0;
         let redirectTerminationError: CaptureError | null = null;
 
@@ -302,10 +317,10 @@ export class CaptureService {
           if (status >= 300 && status < 400) {
             const req =
               typeof response.request === 'function' ? response.request() : null;
-            if (!req || !countedRedirectRequests.has(req)) {
-              if (req) {
-                countedRedirectRequests.add(req);
-              }
+            if (!req) {
+              redirectCount++;
+            } else if (!countedRedirectSourceRequests.has(req)) {
+              countedRedirectSourceRequests.add(req);
               redirectCount++;
             }
             if (redirectCount > policy.maxRedirects) {
@@ -360,8 +375,9 @@ export class CaptureService {
               typeof req.redirectedFrom === 'function' &&
               req.redirectedFrom() !== null
             ) {
-              if (!countedRedirectRequests.has(req)) {
-                countedRedirectRequests.add(req);
+              const prevReq = req.redirectedFrom();
+              if (prevReq && !countedRedirectSourceRequests.has(prevReq)) {
+                countedRedirectSourceRequests.add(prevReq);
                 redirectCount++;
               }
               if (redirectCount > policy.maxRedirects) {
@@ -563,6 +579,7 @@ export class CaptureService {
         });
 
         // 7. Navigate to target URL with bounded navigation timeout
+        checkCancelled();
         try {
           await page.goto(validatedTarget.normalizedUrl, {
             timeout: policy.navigationTimeoutMs,
@@ -587,6 +604,7 @@ export class CaptureService {
           );
         }
 
+        checkCancelled();
         if (redirectTerminationError) {
           throw redirectTerminationError;
         }
@@ -599,6 +617,7 @@ export class CaptureService {
         }
 
         // 8. Re-validate final landing URL after potential redirects
+        checkCancelled();
         const finalUrl = page.url();
         let validatedFinalDestination: ValidatedDestination;
         try {
@@ -611,6 +630,7 @@ export class CaptureService {
             err,
           );
         }
+        checkCancelled();
 
         // 9. Capture screenshot artifact
         let screenshotBuffer: Buffer;
@@ -655,6 +675,8 @@ export class CaptureService {
           );
         }
 
+        checkCancelled();
+
         // 10. Capture DOM snapshot artifact
         let domSnapshot: string;
         try {
@@ -685,6 +707,8 @@ export class CaptureService {
           );
         }
 
+        checkCancelled();
+
         // 11. Extract bounded computed styles and accurate DOM element count
         let evaluationResult: DomEvaluationResult;
         try {
@@ -712,12 +736,19 @@ export class CaptureService {
                 styles.push({
                   selector,
                   tagName: el.tagName.toLowerCase(),
-                  boundingBox: {
-                    x: Math.round(rect.x),
-                    y: Math.round(rect.y),
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height),
-                  },
+                  boundingBox:
+                    rect &&
+                    Number.isFinite(rect.x) &&
+                    Number.isFinite(rect.y) &&
+                    Number.isFinite(rect.width) &&
+                    Number.isFinite(rect.height)
+                      ? {
+                          x: Math.round(rect.x),
+                          y: Math.round(rect.y),
+                          width: Math.round(rect.width),
+                          height: Math.round(rect.height),
+                        }
+                      : null,
                   styles: {
                     color: cs.color || '',
                     backgroundColor: cs.backgroundColor || '',
@@ -750,6 +781,7 @@ export class CaptureService {
             err,
           );
         }
+        checkCancelled();
 
         // Handle both DomEvaluationResult object and legacy array mocks
         let totalDomElements: number;
@@ -761,9 +793,10 @@ export class CaptureService {
         } else if (
           evaluationResult &&
           typeof evaluationResult.totalDomElements === 'number' &&
+          Number.isFinite(evaluationResult.totalDomElements) &&
           Array.isArray(evaluationResult.computedStyles)
         ) {
-          totalDomElements = evaluationResult.totalDomElements;
+          totalDomElements = Math.max(0, Math.floor(evaluationResult.totalDomElements));
           computedStyles = evaluationResult.computedStyles;
         } else {
           throw new CaptureError(
@@ -772,8 +805,13 @@ export class CaptureService {
           );
         }
 
+        // Enforce strict upper bound on computed styles records
+        if (computedStyles.length > policy.maxDomElements) {
+          computedStyles = computedStyles.slice(0, policy.maxDomElements);
+        }
+
         // 12. Assemble capture metadata and validated result
-        const durationMs = Date.now() - startTime;
+        const durationMs = Math.max(0, Date.now() - startTime);
         const metadata: CaptureMetadata = {
           captureTimestamp: new Date().toISOString(),
           durationMs,
@@ -787,6 +825,8 @@ export class CaptureService {
           domSizeBytes: domByteSize,
           computedStylesCount: computedStyles.length,
         };
+
+        checkCancelled();
 
         return {
           success: true,
@@ -811,7 +851,9 @@ export class CaptureService {
       throw new CaptureError(
         CaptureErrorCode.NAVIGATION_FAILED,
         'Unexpected error occurred during capture',
-        err,
+        err instanceof Error
+          ? { message: sanitizeErrorMessage(err.message) }
+          : undefined,
       );
     } finally {
       cancelOverallTimer();

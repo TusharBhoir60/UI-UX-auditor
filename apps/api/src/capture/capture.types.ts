@@ -7,6 +7,7 @@ export enum CaptureErrorCode {
   INVALID_TARGET = 'INVALID_TARGET',
   BLOCKED_DESTINATION = 'BLOCKED_DESTINATION',
   BLOCKED_REDIRECT = 'BLOCKED_REDIRECT',
+  DNS_RESOLUTION_FAILED = 'DNS_RESOLUTION_FAILED',
   BROWSER_LAUNCH_FAILED = 'BROWSER_LAUNCH_FAILED',
   NAVIGATION_FAILED = 'NAVIGATION_FAILED',
   TIMEOUT = 'TIMEOUT',
@@ -15,17 +16,40 @@ export enum CaptureErrorCode {
 }
 
 /**
+ * Sanitizes an error message by redacting raw embedded credentials in URLs.
+ */
+export function sanitizeErrorMessage(message: string): string {
+  if (!message) return '';
+  return message.replace(
+    /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)([^:]+):([^@]+)@/g,
+    '$1***:***@',
+  );
+}
+
+/**
  * Typed, safe error returned or thrown by CaptureService.
  * Sanitized to never leak raw credentials, internal network paths, or stack traces.
  */
 export class CaptureError extends Error {
+  public readonly cause?: unknown;
+
   constructor(
     public readonly code: CaptureErrorCode,
     public readonly safeReason: string,
-    public readonly cause?: unknown,
+    cause?: unknown,
   ) {
     super(`[${code}] ${safeReason}`);
     this.name = 'CaptureError';
+    if (cause instanceof Error) {
+      this.cause = {
+        name: cause.name,
+        message: sanitizeErrorMessage(cause.message),
+      };
+    } else if (typeof cause === 'string') {
+      this.cause = sanitizeErrorMessage(cause);
+    } else {
+      this.cause = cause;
+    }
   }
 }
 

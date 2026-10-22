@@ -7,7 +7,11 @@ import {
   PNG_MAGIC_BYTES,
 } from './capture.constants';
 import { CaptureService } from './capture.service';
-import { CaptureErrorCode, ElementComputedStyle } from './capture.types';
+import {
+  CaptureErrorCode,
+  ElementComputedStyle,
+  sanitizeErrorMessage,
+} from './capture.types';
 import { DestinationGuardService } from './destination-guard.service';
 import {
   DestinationErrorCode,
@@ -174,6 +178,24 @@ describe('CaptureService', () => {
       ).rejects.toMatchObject({
         code: CaptureErrorCode.INVALID_TARGET,
         safeReason: 'Target URL is malformed or unparseable',
+      });
+
+      expect(mockBrowserProvider.launch).not.toHaveBeenCalled();
+    });
+
+    it('maps DNS resolution failure to typed CaptureError with DNS_RESOLUTION_FAILED', async () => {
+      mockDestinationGuard.validate.mockRejectedValueOnce(
+        new DestinationGuardError(
+          DestinationErrorCode.DNS_RESOLUTION_FAILED,
+          'DNS resolution failed for the destination hostname',
+        ),
+      );
+
+      await expect(
+        service.capture({ url: 'https://non-existent-domain-xyz.test' }),
+      ).rejects.toMatchObject({
+        code: CaptureErrorCode.DNS_RESOLUTION_FAILED,
+        safeReason: 'DNS resolution failed for the destination hostname',
       });
 
       expect(mockBrowserProvider.launch).not.toHaveBeenCalled();
@@ -884,6 +906,132 @@ describe('CaptureService', () => {
         expect(captureError.message).not.toContain('super_secret');
         expect(captureError.message).not.toContain('10.200.1.5');
       }
+    });
+
+    it('sanitizeErrorMessage redacts embedded credentials from URL strings', () => {
+      expect(
+        sanitizeErrorMessage('Error navigating to http://alice:supersecret@example.com/test'),
+      ).toBe('Error navigating to http://***:***@example.com/test');
+      expect(
+        sanitizeErrorMessage('Failed https://token:secret123@sub.domain.org:8080/path?q=1'),
+      ).toBe('Failed https://***:***@sub.domain.org:8080/path?q=1');
+      expect(sanitizeErrorMessage('Normal error message without credentials')).toBe(
+        'Normal error message without credentials',
+      );
+    });
+
+    it('redacts credentials from unexpected error cause messages', async () => {
+      mockPage.goto.mockRejectedValueOnce(
+        new Error('Navigation failed at http://bot:top_secret_pw@unreachable.test/'),
+      );
+
+      try {
+        await service.capture({ url: 'https://example.com/audit' });
+        fail('Expected service.capture to throw');
+      } catch (err: any) {
+        expect(err.code).toBe(CaptureErrorCode.NAVIGATION_FAILED);
+        expect(err.message).not.toContain('top_secret_pw');
+        if (err.cause && err.cause.message) {
+          expect(err.cause.message).not.toContain('top_secret_pw');
+          expect(err.cause.message).toContain('***:***@unreachable.test');
+        }
+      }
+    });
+
+    it('strictly bounds computed styles to maxDomElements even if evaluation returns more items', async () => {
+      const extraStyles: ElementComputedStyle[] = Array.from({ length: 15 }, (_, i) => ({
+        selector: `div:nth-of-type(${i + 1})`,
+        tagName: 'div',
+        boundingBox: { x: i * 10, y: i * 10, width: 100, height: 50 },
+        styles: {
+          color: 'rgb(0, 0, 0)',
+          backgroundColor: 'rgb(255, 255, 255)',
+          fontSize: '16px',
+          fontWeight: '400',
+          lineHeight: '24px',
+          display: 'block',
+          visibility: 'visible',
+          margin: '0px',
+          padding: '0px',
+        },
+      }));
+
+      mockPage.evaluate.mockResolvedValueOnce({
+        totalDomElements: 45,
+        computedStyles: extraStyles,
+      });
+
+      const result = await service.capture(
+        { url: 'https://example.com/audit' },
+        { maxDomElements: 5 },
+      );
+
+      // Total DOM elements reflects full document, but computedStyles is strictly bounded to 5
+      expect(result.metadata.domElementCount).toBe(45);
+      expect(result.metadata.computedStylesCount).toBe(5);
+      expect(result.computedStyles.length).toBe(5);
+      expect(result.computedStyles.length).toBe(result.metadata.computedStylesCount);
+    });
+
+    it('sanitizes non-finite boundingBox coordinates to null', async () => {
+      mockPage.evaluate.mockResolvedValueOnce({
+        totalDomElements: 1,
+        computedStyles: [
+          {
+            selector: 'div',
+            tagName: 'div',
+            boundingBox: null,
+            styles: {
+              color: 'rgb(0, 0, 0)',
+              backgroundColor: 'rgb(255, 255, 255)',
+              fontSize: '16px',
+              fontWeight: '400',
+              lineHeight: '24px',
+              display: 'block',
+              visibility: 'visible',
+              margin: '0px',
+              padding: '0px',
+            },
+          },
+        ],
+      });
+
+      const result = await service.capture({ url: 'https://example.com/audit' });
+      expect(result.computedStyles[0].boundingBox).toBeNull();
+    });
+
+    it('rejects with ARTIFACT_GENERATION_FAILED when DOM snapshot is whitespace only', async () => {
+      mockPage.content.mockResolvedValueOnce('   \n\t  \r\n  ');
+
+      await expect(
+        service.capture({ url: 'https://example.com/audit' }),
+      ).rejects.toMatchObject({
+        code: CaptureErrorCode.ARTIFACT_GENERATION_FAILED,
+        safeReason: 'DOM snapshot output is empty',
+      });
+    });
+
+    it('prevents late asynchronous completion from returning success after overall timeout fires', async () => {
+      // Simulate slow evaluate that completes after timeout fires
+      mockPage.evaluate.mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 80));
+        return {
+          totalDomElements: 5,
+          computedStyles: VALID_COMPUTED_STYLES,
+        };
+      });
+
+      await expect(
+        service.capture(
+          { url: 'https://example.com/audit' },
+          { overallTimeoutMs: 30 },
+        ),
+      ).rejects.toMatchObject({
+        code: CaptureErrorCode.TIMEOUT,
+        safeReason: expect.stringContaining('Overall capture exceeded 30ms timeout'),
+      });
+
+      expect(mockBrowser.close).toHaveBeenCalled();
     });
   });
 });

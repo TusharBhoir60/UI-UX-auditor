@@ -48,14 +48,23 @@ The headless browser (Playwright) executes untrusted third-party HTML, CSS, and 
 - Chromium sandbox kept strictly ENABLED (no `--no-sandbox` flag).
 - Hard overall timeout (`policy.overallTimeoutMs`, default 30s) bounding the entire capture execution.
 - Idempotent and bounded resource cleanup (`RESOURCE_CLEANUP_TIMEOUT_MS = 2,000ms`) ensuring hung `page.close()`, `context.close()`, or `browser.close()` calls cannot hang the worker.
-- Cancellation guards (`isCancelled`) to immediately terminate late-launched browser processes.
+- Cancellation guards (`checkCancelled()`) at every async checkpoint preventing late-launched browser processes or delayed async operations from returning success after timeout.
 - Artifact boundary enforcement:
-  - Traversal bounded to `policy.maxDomElements` (1,000) during computed styles extraction.
+  - Traversal and returned records strictly bounded to `policy.maxDomElements` (1,000) during computed styles extraction.
+  - Distinguishes total document elements (`domElementCount`) from extracted style records (`computedStylesCount`).
+  - Validates non-empty PNG magic bytes (`0x89504E470D0A1A0A`) on screenshot buffers.
+  - Validates non-empty DOM snapshots and measures size via UTF-8 byte count.
   - Post-generation size bounds on screenshot (10 MB) and DOM snapshot (5 MB) preventing oversized payloads from propagating downstream.
+- Redirect hop deduplication: Tracks redirect source requests across route requests and 3xx response events to guarantee each hop is counted exactly once without double counting.
 - Restricted browser context: `acceptDownloads: false`, `serviceWorkers: 'block'`, dialogs auto-dismissed, popups auto-closed.
+- Typed error taxonomy & credential redaction:
+  - Stable error taxonomy: `INVALID_TARGET`, `BLOCKED_DESTINATION`, `BLOCKED_REDIRECT`, `DNS_RESOLUTION_FAILED`, `BROWSER_LAUNCH_FAILED`, `NAVIGATION_FAILED`, `TIMEOUT`, `ARTIFACT_GENERATION_FAILED`, `ARTIFACT_LIMIT_EXCEEDED`.
+  - Redaction of embedded credentials (`user:pass@host`) from error reasons and cause messages.
+  - Stack traces and internal network topology suppressed from caller-facing errors.
 
 ### Deployment-Level Controls
-- Post-generation artifact size checks do NOT prevent in-process memory allocation during rendering. Pathological pages (e.g. DOM bombs with 500,000 elements) require container memory ceilings (cgroups) to prevent worker host OOM.
+- **Post-Generation Artifact Size Check Limitations:** Post-generation artifact size checks do NOT prevent in-process memory allocation during rendering in Chromium or V8. Pathological pages (e.g. DOM bombs with 500,000 elements) require container memory ceilings (cgroups `--memory=1g`) to prevent worker host OOM.
+- **In-Process Timeout Limitations:** In-process timeouts (`overallTimeoutMs`, `navigationTimeoutMs`) and bounded cleanup (`closeWithTimeout`) bound Node.js event-loop execution, but do NOT guarantee OS-level process termination of an unresponsive or zombie Chromium process. Ephemeral container termination / supervisor process restart upon timeout is mandatory.
 
 
 ## 3. Prompt Injection Resistance
