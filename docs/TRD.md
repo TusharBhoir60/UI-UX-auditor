@@ -195,6 +195,48 @@ To decouple HTTP audit submission from browser execution and external network la
   - *Indefinite Infrastructure Outages:* Reconciliation cannot guarantee recovery if Redis or PostgreSQL remains permanently unavailable; recovery occurs deterministically once services become reachable.
   - *Fencing Tokens:* Stage 6+ multi-stage pipeline extension should introduce a fencing token or attempt-counter on `Audit` to allow safe multi-attempt automatic retries.
 
+### 4c. Deterministic Rule Engine Module (`RulesModule`)
+
+To establish high trust and reproducible audit outcomes, deterministic analysis is decoupled from qualitative AI analysis and browser orchestration:
+
+- **Module Responsibility:**
+  - Evaluates captured page artifacts (`domSnapshot`, `computedStyles`) against exact, code-defined web accessibility and interface-quality standards.
+  - Enforces the governing principle from `AI_RULES.md`: checks with exact standards (`WCAG 1.1.1`, `WCAG 1.3.1`, `WCAG 1.4.3`, `WCAG 2.4.2`, `WCAG 4.1.2`) are computed deterministically. AI is reserved strictly for subjective visual hierarchy and heuristic evaluations.
+- **Input and Output Contracts:**
+  - **Input (`RuleEvidenceInput`):**
+    - `domSnapshot`: string containing the UTF-8 HTML document.
+    - `computedStyles`: array of bounded `ElementComputedStyle` extracted by `CaptureService`.
+    - `url`: optional target landing URL.
+  - **Output (`RuleEngineResult`):**
+    - `evaluatedAt`: ISO timestamp.
+    - `durationMs`: execution duration in milliseconds.
+    - `rulesEvaluatedCount`: total rules registered and executed.
+    - `passedRulesCount`, `findingRulesCount`, `notEvaluableRulesCount`, `totalFindingsCount`.
+    - `results`: detailed per-rule outcomes (`RuleResult`) with status (`pass` | `finding` | `not-evaluable`), element counts, and failure reasons.
+    - `findings`: flattened array of discrete, typed `RuleFinding` records for downstream aggregation.
+- **Rule Execution Boundary:**
+  - `RuleEngineService.evaluate()` is a pure, in-memory CPU operation.
+  - It does NOT launch browsers, does NOT access Redis or message queues, does NOT interact with PostgreSQL or update audit records, and does NOT execute page-provided JavaScript.
+  - Each rule executes inside an isolated try-catch block; an unexpected failure in one rule is reported as `not-evaluable` without aborting remaining rules or crashing the process.
+- **Evidence Traceability:**
+  - Every `RuleFinding` includes a typed `evidence` record containing:
+    - `selector`: CSS selector matching the DOM element.
+    - `tagName`: normalized HTML tag name.
+    - `snippet`: raw HTML snippet of the element (bounded length).
+    - `boundingBox`: `{ x, y, width, height }` coordinates if correlated from captured computed styles.
+    - `expected`: standard requirement or threshold.
+    - `observed`: actual measurement or missing attribute.
+- **Handling of Missing or Ambiguous Evidence:**
+  - Missing evidence is never falsely reported as a pass.
+  - When input HTML is empty or unparseable, rules return `not-evaluable` with a descriptive reason.
+  - When computed styles lack explicit opaque background colors (e.g., transparent `rgba(0, 0, 0, 0)` or inherited backgrounds), the contrast rule (`text-contrast-minimum`) returns `not-evaluable` rather than fabricating an arbitrary background color.
+- **Implemented Initial Rule Set:**
+  1. `doc-title-present` (WCAG 2.4.2 Level A): Verifies non-empty document `<title>`.
+  2. `img-alt-present` (WCAG 1.1.1 Level A): Verifies presence of descriptive `alt` attribute or explicit decorative marker (`alt=""`, `role="presentation"`, `aria-hidden="true"`).
+  3. `button-name-present` (WCAG 4.1.2 Level A): Verifies accessible name on `<button>` elements (inner text, `aria-label`, `aria-labelledby`, or `title`).
+  4. `heading-order-valid` (WCAG 1.3.1 Level A): Verifies presence of top-level `<h1>`, non-empty heading text, and sequential hierarchy without skipped levels.
+  5. `text-contrast-minimum` (WCAG 1.4.3 Level AA): Computes exact relative luminance contrast ratio for text with explicit opaque backgrounds (4.5:1 standard, 3.0:1 large text); safely marks unresolvable backgrounds as `not-evaluable`.
+
 ## 5. Key Architectural Decisions
 
 | # | Decision | Chosen Approach | Reasoning | Reversible later? |

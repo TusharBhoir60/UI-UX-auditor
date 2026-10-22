@@ -6,6 +6,7 @@ import { AuthModule } from './auth/auth.module';
 import { AuditsModule } from './audits/audits.module';
 import { CaptureModule } from './capture/capture.module';
 import { QueueModule } from './queue/queue.module';
+import { RulesModule } from './rules/rules.module';
 
 @Module({
   imports: [
@@ -16,6 +17,7 @@ import { QueueModule } from './queue/queue.module';
     AuditsModule,
     CaptureModule,
     QueueModule,
+    RulesModule,
   ],
 })
 export class AppModule {}
