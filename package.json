@@ -1,0 +1,16 @@
+{
+  "name": "ui-ux-auditor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Evidence-backed UI/UX auditing platform",
+  "workspaces": ["apps/web", "apps/api"],
+  "scripts": {
+    "dev:web": "npm run dev --workspace @ui-ux-auditor/web",
+    "dev:api": "npm run start:dev --workspace @ui-ux-auditor/api",
+    "build:web": "npm run build --workspace @ui-ux-auditor/web",
+    "build:api": "npm run build --workspace @ui-ux-auditor/api",
+    "lint:web": "npm run lint --workspace @ui-ux-auditor/web",
+    "lint:api": "npm run lint --workspace @ui-ux-auditor/api"
+  },
+  "engines": { "node": ">=20.0.0" }
+}
