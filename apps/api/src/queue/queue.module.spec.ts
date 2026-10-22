@@ -3,6 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { QueueModule } from './queue.module';
 import { AuditQueueService } from './audit-queue.service';
 import { AuditWorkerProcessor } from './audit-worker.processor';
+import { AuditReconciliationService } from './audit-reconciliation.service';
 import { AuditsModule } from '../audits/audits.module';
 import { PrismaService } from '../database/prisma.service';
 import { CaptureService } from '../capture/capture.service';
@@ -37,6 +38,8 @@ describe('QueueModule Dependency Injection', () => {
               JWT_SECRET: 'test-secret-at-least-32-chars-long-security',
               REDIS_HOST: 'localhost',
               REDIS_PORT: 6379,
+              WORKER_ENABLED: false, // Prevents worker from connecting during module compilation test
+              AUDIT_RECONCILIATION_INTERVAL_MS: 0, // Disables background timer during module compilation test
             }),
           ],
         }),
@@ -50,6 +53,7 @@ describe('QueueModule Dependency Injection', () => {
           create: jest.fn(),
           findUnique: jest.fn(),
           updateMany: jest.fn(),
+          findMany: jest.fn(),
         },
       })
       .overrideProvider(CaptureService)
@@ -67,14 +71,20 @@ describe('QueueModule Dependency Injection', () => {
     await module.close();
   });
 
-  it('compiles and resolves AuditQueueService and AuditWorkerProcessor', () => {
+  it('compiles and resolves AuditQueueService, AuditWorkerProcessor, and AuditReconciliationService', () => {
     const queueService = module.get<AuditQueueService>(AuditQueueService);
     const workerProcessor = module.get<AuditWorkerProcessor>(AuditWorkerProcessor);
+    const reconciliationService = module.get<AuditReconciliationService>(
+      AuditReconciliationService,
+    );
 
     expect(queueService).toBeDefined();
     expect(queueService).toBeInstanceOf(AuditQueueService);
 
     expect(workerProcessor).toBeDefined();
     expect(workerProcessor).toBeInstanceOf(AuditWorkerProcessor);
+
+    expect(reconciliationService).toBeDefined();
+    expect(reconciliationService).toBeInstanceOf(AuditReconciliationService);
   });
 });

@@ -38,6 +38,14 @@ export class AuditWorkerProcessor implements OnModuleInit, OnModuleDestroy {
   }
 
   onModuleInit() {
+    const workerEnabled = this.configService.get<boolean>('WORKER_ENABLED', true);
+    if (!workerEnabled) {
+      this.logger.log(
+        'AuditWorkerProcessor is disabled (WORKER_ENABLED=false); skipping worker startup.',
+      );
+      return;
+    }
+
     if (!this.worker) {
       const connection = this.buildConnectionOptions();
       this.worker = new Worker<AuditJobData, void, string>(
@@ -111,17 +119,17 @@ export class AuditWorkerProcessor implements OnModuleInit, OnModuleDestroy {
           case AuditOrchestrationErrorCode.INVALID_STATE_TRANSITION:
           case AuditOrchestrationErrorCode.CONCURRENT_CONFLICT:
             this.logger.warn(
-              `Skipping duplicate or already-claimed audit ${auditId}: [${err.code}] ${err.safeMessage}`,
+              `[Audit Already Claimed/Terminal] auditId=${auditId} code=${err.code}: ${err.safeMessage}`,
             );
             return;
           case AuditOrchestrationErrorCode.AUDIT_NOT_FOUND:
             this.logger.warn(
-              `Audit ${auditId} not found in database: [${err.code}] ${err.safeMessage}`,
+              `[Audit Not Found] auditId=${auditId} code=${err.code}: ${err.safeMessage}`,
             );
             return;
           case AuditOrchestrationErrorCode.PERSISTENCE_FAILED:
             this.logger.error(
-              `Persistence failure while processing audit ${auditId}: ${err.safeMessage}`,
+              `[Worker Persistence Failure] auditId=${auditId}: ${err.safeMessage}`,
             );
             throw err;
         }
@@ -131,7 +139,7 @@ export class AuditWorkerProcessor implements OnModuleInit, OnModuleDestroy {
         err instanceof Error ? err.message : 'Unknown worker error',
       );
       this.logger.error(
-        `Unexpected worker failure processing audit ${auditId}: ${safeReason}`,
+        `[Unexpected Worker Failure] auditId=${auditId}: ${safeReason}`,
       );
       throw new Error(safeReason);
     }

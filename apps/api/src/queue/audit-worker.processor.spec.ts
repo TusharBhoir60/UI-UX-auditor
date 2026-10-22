@@ -194,7 +194,28 @@ describe('AuditWorkerProcessor', () => {
       await expect(processor.onModuleDestroy()).resolves.toBeUndefined();
     });
 
+    it('skips worker initialization when WORKER_ENABLED is false', () => {
+      mockConfigService.get.mockImplementation((key: string, defaultValue?: unknown) => {
+        if (key === 'WORKER_ENABLED') return false;
+        return defaultValue;
+      });
+
+      const liveProcessor = new AuditWorkerProcessor(
+        mockOrchestrator as unknown as AuditOrchestratorService,
+        mockConfigService as unknown as ConfigService,
+      );
+      liveProcessor.onModuleInit();
+      expect(liveProcessor.getWorker()).toBeUndefined();
+    });
+
     it('initializes a default worker and registers event listeners when not injected', () => {
+      mockConfigService.get.mockImplementation((key: string, defaultValue?: unknown) => {
+        if (key === 'WORKER_ENABLED') return true;
+        if (key === 'REDIS_HOST') return 'localhost';
+        if (key === 'REDIS_PORT') return 6379;
+        return defaultValue;
+      });
+
       const liveProcessor = new AuditWorkerProcessor(
         mockOrchestrator as unknown as AuditOrchestratorService,
         mockConfigService as unknown as ConfigService,

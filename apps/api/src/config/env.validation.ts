@@ -10,6 +10,10 @@ export interface EnvConfig {
   REDIS_PORT: number;
   REDIS_PASSWORD?: string;
   REDIS_TLS?: boolean;
+  WORKER_ENABLED?: boolean;
+  AUDIT_RECONCILIATION_INTERVAL_MS: number;
+  AUDIT_RECONCILIATION_STALE_THRESHOLD_MS: number;
+  AUDIT_RECONCILIATION_BATCH_SIZE: number;
 }
 
 const KNOWN_INSECURE_PLACEHOLDERS = new Set([
@@ -185,6 +189,60 @@ export function validateEnv(config: Record<string, unknown>): EnvConfig {
     }
   }
 
+  // 12. WORKER_ENABLED
+  const rawWorkerEnabled = config.WORKER_ENABLED;
+  let workerEnabled = true;
+  if (rawWorkerEnabled !== undefined && rawWorkerEnabled !== null && rawWorkerEnabled !== '') {
+    const stringVal = String(rawWorkerEnabled).trim().toLowerCase();
+    if (stringVal === 'true' || stringVal === '1') {
+      workerEnabled = true;
+    } else if (stringVal === 'false' || stringVal === '0') {
+      workerEnabled = false;
+    } else {
+      errors.push("WORKER_ENABLED must be a boolean ('true' or 'false').");
+    }
+  }
+
+  // 13. AUDIT_RECONCILIATION_INTERVAL_MS
+  const rawReconInterval = config.AUDIT_RECONCILIATION_INTERVAL_MS;
+  let reconIntervalMs = 60000;
+  if (rawReconInterval !== undefined && rawReconInterval !== null && rawReconInterval !== '') {
+    const parsed = Number(rawReconInterval);
+    if (Number.isInteger(parsed) && parsed >= 0) {
+      reconIntervalMs = parsed;
+    } else {
+      errors.push('AUDIT_RECONCILIATION_INTERVAL_MS must be an integer >= 0.');
+    }
+  }
+
+  // 14. AUDIT_RECONCILIATION_STALE_THRESHOLD_MS
+  const rawStaleThreshold = config.AUDIT_RECONCILIATION_STALE_THRESHOLD_MS;
+  let staleThresholdMs = 300000;
+  if (rawStaleThreshold !== undefined && rawStaleThreshold !== null && rawStaleThreshold !== '') {
+    const parsed = Number(rawStaleThreshold);
+    if (Number.isInteger(parsed) && parsed >= 10000) {
+      staleThresholdMs = parsed;
+    } else {
+      errors.push(
+        'AUDIT_RECONCILIATION_STALE_THRESHOLD_MS must be an integer >= 10000 (milliseconds).',
+      );
+    }
+  }
+
+  // 15. AUDIT_RECONCILIATION_BATCH_SIZE
+  const rawBatchSize = config.AUDIT_RECONCILIATION_BATCH_SIZE;
+  let batchSize = 50;
+  if (rawBatchSize !== undefined && rawBatchSize !== null && rawBatchSize !== '') {
+    const parsed = Number(rawBatchSize);
+    if (Number.isInteger(parsed) && parsed >= 1 && parsed <= 500) {
+      batchSize = parsed;
+    } else {
+      errors.push(
+        'AUDIT_RECONCILIATION_BATCH_SIZE must be an integer between 1 and 500.',
+      );
+    }
+  }
+
   if (errors.length > 0) {
     throw new Error(`Environment validation failed:\n  - ${errors.join('\n  - ')}`);
   }
@@ -201,5 +259,9 @@ export function validateEnv(config: Record<string, unknown>): EnvConfig {
     REDIS_PORT: redisPort,
     REDIS_PASSWORD: redisPassword,
     REDIS_TLS: redisTls,
+    WORKER_ENABLED: workerEnabled,
+    AUDIT_RECONCILIATION_INTERVAL_MS: reconIntervalMs,
+    AUDIT_RECONCILIATION_STALE_THRESHOLD_MS: staleThresholdMs,
+    AUDIT_RECONCILIATION_BATCH_SIZE: batchSize,
   };
 }

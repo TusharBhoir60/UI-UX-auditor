@@ -124,6 +124,16 @@ The introduction of asynchronous background workers creates additional trust bou
   - Workers rely strictly on atomic conditional state transitions in PostgreSQL (`updateMany where status = 'queued'`) to claim execution authority.
   - Duplicate deliveries or retries for already running or completed audits are safely acknowledged without overwriting state or re-executing captures.
   - Enqueue failures trigger compensating updates marking the audit as `failed`, ensuring jobs are never left silently stranded.
+- **Stale Audit Reconciliation Security:**
+  - Bounded queries (`take: batchSize`, default 50, maximum 500) prevent unbounded memory growth and database resource exhaustion during reconciliation sweeps.
+  - Reconciliation exclusively queries audits in `status = 'queued'` and verifies BullMQ job states before re-enqueueing.
+  - Re-enqueue uses the stable audit-based `jobId`; no user input or payload URLs are processed.
+  - Structured operational logs redact credentials, database connection strings, and sensitive URLs (`[Reconciliation Succeeded]`, `[Reconciliation Failed]`).
+  - Single-process mutex guards prevent concurrent reconciliation overlap within a running instance.
+- **Worker Container Isolation (`WORKER_ENABLED`):**
+  - Production deployments enforce complete process separation between public-facing API servers (`WORKER_ENABLED=false`) and dedicated background workers (`WORKER_ENABLED=true`).
+  - Web/API containers run without browser binaries or Playwright execution permissions.
+  - Worker containers execute inside locked-down container environments with strict cgroups, memory limits, and egress network rules dropping private IP ranges.
 
 ## 9. Explicitly Deferred (Phase 2+, but noted here for awareness)
 

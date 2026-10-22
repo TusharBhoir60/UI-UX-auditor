@@ -95,13 +95,78 @@ export class AuditQueueService implements OnModuleInit, OnModuleDestroy {
           },
         },
       );
-      this.logger.log(`Enqueued audit job for auditId: ${auditId}`);
+      this.logger.log(`[Job Enqueued] auditId=${auditId} jobId=${auditId}`);
     } catch (err) {
       const safeReason = sanitizeErrorMessage(
         err instanceof Error ? err.message : String(err),
       );
       this.logger.error(
         `Failed to enqueue job for audit ${auditId}: ${safeReason}`,
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * Reconciles a stale audit by ensuring an active or waiting job exists in BullMQ.
+   *
+   * HANDLES BULLMQ JOB LIFECYCLE:
+   * - If no job exists with auditId: adds a fresh job to BullMQ.
+   * - If job is 'waiting', 'delayed', or 'prioritized': job is already queued; leaves it intact.
+   * - If job is 'active': a worker is actively executing it; leaves it intact.
+   * - If job is 'failed' or 'completed': BullMQ returns existing jobs without re-enqueueing;
+   *   removes the stale job and adds a fresh job with jobId: auditId.
+   */
+  async reconcileAuditJob(
+    auditId: string,
+  ): Promise<'enqueued' | 'already_waiting' | 'already_active'> {
+    if (!this.queue) {
+      throw new Error('Audit queue is not initialized');
+    }
+
+    try {
+      const existingJob = await this.queue.getJob(auditId);
+      if (!existingJob) {
+        await this.addAuditJob(auditId);
+        this.logger.log(
+          `[Reconciliation Succeeded] auditId=${auditId} re-enqueued to queue (no existing job)`,
+        );
+        return 'enqueued';
+      }
+
+      const state = await existingJob.getState();
+      if (
+        state === 'waiting' ||
+        state === 'delayed' ||
+        state === 'prioritized'
+      ) {
+        this.logger.log(
+          `[Duplicate Job Detected] auditId=${auditId} state=${state} in queue; skipping re-enqueue`,
+        );
+        return 'already_waiting';
+      }
+
+      if (state === 'active') {
+        this.logger.log(
+          `[Duplicate Job Detected] auditId=${auditId} state=active (executing); skipping re-enqueue`,
+        );
+        return 'already_active';
+      }
+
+      // If existing job reached 'failed' or 'completed' in BullMQ,
+      // BullMQ will not re-enqueue with queue.add(). We must remove the stale job first.
+      await existingJob.remove();
+      await this.addAuditJob(auditId);
+      this.logger.log(
+        `[Reconciliation Succeeded] auditId=${auditId} re-enqueued after removing stale '${state}' job from queue`,
+      );
+      return 'enqueued';
+    } catch (err) {
+      const safeReason = sanitizeErrorMessage(
+        err instanceof Error ? err.message : String(err),
+      );
+      this.logger.error(
+        `[Reconciliation Failed] Redis error for auditId=${auditId}: ${safeReason}`,
       );
       throw err;
     }

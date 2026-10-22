@@ -15,6 +15,7 @@ describe('AuditQueueService', () => {
     add: jest.Mock;
     close: jest.Mock;
     on: jest.Mock;
+    getJob: jest.Mock;
   };
   let mockConfigService: {
     get: jest.Mock;
@@ -27,6 +28,7 @@ describe('AuditQueueService', () => {
       add: jest.fn().mockResolvedValue({ id: AUDIT_ID }),
       close: jest.fn().mockResolvedValue(undefined),
       on: jest.fn().mockReturnThis(),
+      getJob: jest.fn().mockResolvedValue(null),
     };
 
     mockConfigService = {
@@ -117,6 +119,99 @@ describe('AuditQueueService', () => {
       );
 
       await expect(uninitService.addAuditJob(AUDIT_ID)).rejects.toThrow(
+        'Audit queue is not initialized',
+      );
+    });
+  });
+
+  describe('reconcileAuditJob', () => {
+    it('enqueues fresh job if no existing job exists in BullMQ', async () => {
+      mockQueue.getJob.mockResolvedValueOnce(null);
+
+      const result = await service.reconcileAuditJob(AUDIT_ID);
+
+      expect(result).toBe('enqueued');
+      expect(mockQueue.add).toHaveBeenCalledWith(
+        AUDIT_JOB_NAME,
+        expect.objectContaining({ auditId: AUDIT_ID }),
+        expect.objectContaining({ jobId: AUDIT_ID }),
+      );
+    });
+
+    it('detects existing job in "waiting" state and skips re-enqueue', async () => {
+      mockQueue.getJob.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        getState: jest.fn().mockResolvedValue('waiting'),
+      });
+
+      const result = await service.reconcileAuditJob(AUDIT_ID);
+
+      expect(result).toBe('already_waiting');
+      expect(mockQueue.add).not.toHaveBeenCalled();
+    });
+
+    it('detects existing job in "active" state and skips re-enqueue', async () => {
+      mockQueue.getJob.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        getState: jest.fn().mockResolvedValue('active'),
+      });
+
+      const result = await service.reconcileAuditJob(AUDIT_ID);
+
+      expect(result).toBe('already_active');
+      expect(mockQueue.add).not.toHaveBeenCalled();
+    });
+
+    it('removes stale "failed" job from Redis and adds fresh job to queue', async () => {
+      const mockRemove = jest.fn().mockResolvedValue(undefined);
+      mockQueue.getJob.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        getState: jest.fn().mockResolvedValue('failed'),
+        remove: mockRemove,
+      });
+
+      const result = await service.reconcileAuditJob(AUDIT_ID);
+
+      expect(mockRemove).toHaveBeenCalledTimes(1);
+      expect(mockQueue.add).toHaveBeenCalledWith(
+        AUDIT_JOB_NAME,
+        expect.objectContaining({ auditId: AUDIT_ID }),
+        expect.objectContaining({ jobId: AUDIT_ID }),
+      );
+      expect(result).toBe('enqueued');
+    });
+
+    it('removes stale "completed" job from Redis and adds fresh job to queue', async () => {
+      const mockRemove = jest.fn().mockResolvedValue(undefined);
+      mockQueue.getJob.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        getState: jest.fn().mockResolvedValue('completed'),
+        remove: mockRemove,
+      });
+
+      const result = await service.reconcileAuditJob(AUDIT_ID);
+
+      expect(mockRemove).toHaveBeenCalledTimes(1);
+      expect(mockQueue.add).toHaveBeenCalledTimes(1);
+      expect(result).toBe('enqueued');
+    });
+
+    it('sanitizes and rethrows Redis errors during reconciliation', async () => {
+      mockQueue.getJob.mockRejectedValueOnce(
+        new Error('Redis timeout at redis://admin:secret@127.0.0.1:6379'),
+      );
+
+      await expect(service.reconcileAuditJob(AUDIT_ID)).rejects.toThrow(
+        /Redis timeout/,
+      );
+    });
+
+    it('throws if queue is not initialized', async () => {
+      const uninitService = new AuditQueueService(
+        mockConfigService as unknown as ConfigService,
+      );
+
+      await expect(uninitService.reconcileAuditJob(AUDIT_ID)).rejects.toThrow(
         'Audit queue is not initialized',
       );
     });

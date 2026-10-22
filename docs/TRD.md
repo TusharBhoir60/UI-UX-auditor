@@ -147,7 +147,7 @@ To decouple HTTP audit submission from browser execution and external network la
   - Queue payloads carry strictly minimal, non-sensitive metadata: `{ auditId: string, createdAt?: string }`.
   - **Authoritative URL Resolution:** Raw URLs, credentials, or user inputs are never passed through queue payloads. The worker and orchestrator strictly load the target URL from PostgreSQL by audit ID, preventing payload spoofing or URL tampering.
   - **No Public HTTP Queue Exposure:** Queue management and internal job metrics are not exposed through public HTTP controllers.
-- **Database-to-Queue Consistency Boundary:**
+- **Database-to-Queue Consistency Boundary & Dual-Write Gap:**
   - Dual writes across PostgreSQL and Redis are not atomic.
   - **Dispatch Workflow:**
     1. The audit record is committed to PostgreSQL in `queued` status.
@@ -155,22 +155,45 @@ To decouple HTTP audit submission from browser execution and external network la
     3. If Redis enqueue fails (connection error or timeout):
        - A compensating update immediately transitions the audit to `failed` with `failureReason = 'Failed to enqueue audit for processing'`.
        - The API returns an observable HTTP 500 (`InternalServerErrorException`) to the client.
-       - The audit is never silently left stranded in `queued` indefinitely.
-    4. If enqueue was ambiguous (e.g., Redis received the job but network timed out before ACK):
-       - The audit is marked `failed` by the compensating update.
-       - When the worker dequeues the job, `AuditOrchestratorService.processAudit` rejects the transition from `failed` to `running` via an atomic conditional update (`updateMany where status = 'queued'`), safely ignoring the job without overwriting the terminal failure state.
-  - **Transactional Outbox Evaluation:** An outbox pattern was evaluated. Since the source-of-truth database schema (`DATABASE.md`, `DATA_MODEL.md`) deliberately omits an outbox table for MVP, the immediate compensating failure update coupled with idempotent worker state claims provides observable failure semantics without speculative schema additions.
+    4. If the compensating update itself fails, or if Redis accepted the job without API ACK, the audit could remain stranded in `queued`. This dual-write failure window is resolved by the Stale Audit Reconciliation mechanism.
+  - **Transactional Outbox Evaluation:** An outbox pattern was evaluated. Since the source-of-truth database schema (`DATABASE.md`, `DATA_MODEL.md`) deliberately omits an outbox table for MVP, the immediate compensating failure update coupled with idempotent worker state claims and stale audit reconciliation provides observable recovery semantics without speculative schema additions.
 - **Duplicate Delivery & Retry Policy:**
   - **Stable Job Identity:** Jobs use `auditId` as the BullMQ `jobId`, preventing duplicate enqueue requests from creating concurrent jobs in Redis.
   - **Conservative Retries (`attempts: 1`):** The current schema lacks fencing tokens or attempt ownership columns. Automatic retries by BullMQ could race with concurrent workers or overwrite audit state; therefore, automatic retries are disabled (`attempts: 1`).
   - **Bounded Retention:** Completed jobs are retained for 24 hours (or up to 1,000 jobs) and failed jobs for 7 days (or up to 5,000 jobs) for operational diagnosis without unbounded memory growth.
-- **Configuration & Lifecycle:**
+- **Stale Queued Audit Reconciliation:**
+  - Managed by `AuditReconciliationService`, running as a periodic background reconciliation loop.
+  - **Configuration:**
+    - `AUDIT_RECONCILIATION_INTERVAL_MS`: Polling interval in ms (default: `60000` / 1 minute; set to `0` to disable the recurring timer).
+    - `AUDIT_RECONCILIATION_STALE_THRESHOLD_MS`: Age threshold in ms before a `queued` audit is considered stale (default: `300000` / 5 minutes; minimum: `10000` / 10 seconds).
+    - `AUDIT_RECONCILIATION_BATCH_SIZE`: Maximum audits processed per batch (default: `50`; range: `1..500`).
+  - **Discovery Query:** Selects audits matching `status = 'queued'` and `createdAt <= (now - staleThreshold)`, sorted by `createdAt ASC`, strictly bounded by `take: batchSize`. Terminal (`complete`, `failed`) and running (`running`) audits are strictly excluded.
+  - **Concurrency & Overlap Prevention:**
+    - Single-process mutex (`isReconciling` flag) prevents overlapping runs within a single instance.
+    - Across multi-replica deployments, BullMQ stable `jobId` deduplication and PostgreSQL atomic conditional status claims (`updateMany where status = 'queued'`) prevent duplicate execution.
+  - **BullMQ Idempotency & Re-Enqueue Semantics:**
+    - BullMQ will reject/ignore `queue.add()` for jobs whose `jobId` already exists in `failed` or `completed` state under retention.
+    - `AuditQueueService.reconcileAuditJob` inspects existing job status:
+      - If `waiting`, `delayed`, or `prioritized`: Logged as `already_waiting` and left untouched.
+      - If `active`: Logged as `already_active` and left untouched.
+      - If `completed` or `failed` (retained terminal job in Redis while PostgreSQL still records `queued`): Stale job is removed via `existingJob.remove()` and re-enqueued fresh with `jobId: auditId`.
+      - If non-existent in Redis: Freshly enqueued with `jobId: auditId`.
+  - **Resilience & Fault Isolation:**
+    - Database query errors are safely caught, logged, and abort the current cycle without crashing the host process.
+    - Redis errors during per-audit re-enqueue are caught and logged individually without aborting remaining batch items.
+- **Queue and Module Lifecycle:**
   - Validated environment configuration: `REDIS_HOST` (default `localhost`), `REDIS_PORT` (default `6379`), optional `REDIS_PASSWORD`, and optional `REDIS_TLS`.
-  - Queue and worker lifecycle managed via NestJS `OnModuleInit` and `OnModuleDestroy` hooks (`queue.close()`, `worker.close()`).
+  - `WORKER_ENABLED` (boolean, default: `true`): Allows splitting API and Worker deployments into distinct container roles.
+    - API container: `WORKER_ENABLED=false` (handles HTTP ingestion, queue dispatch, and reconciliation without initializing Playwright or browser processes).
+    - Worker container: `WORKER_ENABLED=true` (processes background capture jobs with browser sandboxing and OS-level cgroups).
+  - Queue, worker, and reconciliation lifecycle managed via NestJS `OnModuleInit` and `OnModuleDestroy` hooks (`queue.close()`, `worker.close()`, `clearInterval()`).
   - Bounded connection timeouts (5,000ms) and retry strategies prevent worker or startup hangs during Redis unreachability.
+  - **Module Dependencies & `forwardRef()`:**
+    - Monolithic packaging uses `forwardRef()` between `AuditsModule` and `QueueModule` because `AuditsService` creates queue jobs while `AuditWorkerProcessor` delegates to `AuditOrchestratorService`.
+    - In container-isolated production deployments, API containers omit `AuditWorkerProcessor` and Worker containers omit `AuditsController`, eliminating cyclic dependencies.
 - **Remaining Limitations & Future Enhancements:**
-  - *Dual-write compensation failure:* If Redis enqueue fails and the subsequent PostgreSQL compensation update also fails, the audit remains `queued` until swept by an administrative reconciliation script.
-  - *Fencing tokens:* Stage 6+ multi-stage pipeline extension should introduce a fencing token or attempt-counter on `Audit` to allow safe automatic retries.
+  - *Indefinite Infrastructure Outages:* Reconciliation cannot guarantee recovery if Redis or PostgreSQL remains permanently unavailable; recovery occurs deterministically once services become reachable.
+  - *Fencing Tokens:* Stage 6+ multi-stage pipeline extension should introduce a fencing token or attempt-counter on `Audit` to allow safe multi-attempt automatic retries.
 
 ## 5. Key Architectural Decisions
 
