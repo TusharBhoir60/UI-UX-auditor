@@ -107,6 +107,35 @@ This replaces an earlier default of Java + Spring Boot. Reasoning, compared agai
 
 Failure at any stage (esp. step 3-4: page unreachable, blocked, requires auth) marks the job `failed` with a specific, user-facing reason — never a silent empty report. If step 6 (AI) fails but step 5 succeeded, the report is still generated from deterministic findings, flagged as partial.
 
+### 4a. Capture Module / Pipeline Orchestration Boundary
+
+To preserve strict modular boundaries and maintain testability, the Capture Module is decoupled from orchestration and storage concerns:
+
+- **Interface Contract:**
+  - **Invocation:** `CaptureService.capture({ url: string }, policy?: Partial<CapturePolicy>): Promise<CaptureResult>`
+  - **Inputs:** A single URL string provided by the pipeline orchestrator. Destination validation (`DestinationGuardService`) is mandatory and enforced fail-closed prior to browser navigation.
+  - **Outputs:** In-memory `CaptureResult` containing only:
+    - `metadata`: `CaptureMetadata` (timestamps, duration, viewport, element/style/byte counts, resolved IPs, redirect count)
+    - `screenshot`: Raw `Buffer` (validated PNG header)
+    - `domSnapshot`: `string` (UTF-8 HTML)
+    - `computedStyles`: `ElementComputedStyle[]` (bounded to `maxDomElements`)
+    - `validatedDestination`: `ValidatedDestination` (normalized destination details)
+  - **Encapsulation:** No browser handles, Playwright pages, browser contexts, or routing hooks escape `CaptureModule`.
+- **Architectural Non-Goals for Capture Module:**
+  - **No Database Persistence:** `CaptureModule` does not inject `PrismaService` or touch the database. Persisting `AuditCapture` records is the responsibility of the Stage 5 worker/orchestrator.
+  - **No Queue Coupling:** Does not depend on BullMQ or Redis.
+  - **No Object Storage Side-Effects:** Uploading screenshots or artifacts to S3/R2 is handled downstream in the pipeline.
+  - **No HTTP Exposure:** `CaptureService` is an internal service, not bound to any HTTP controller or public route.
+- **Error Semantics & Mapping:**
+  - Throws typed `CaptureError` with stable codes (`INVALID_TARGET`, `BLOCKED_DESTINATION`, `BLOCKED_REDIRECT`, `DNS_RESOLUTION_FAILED`, `BROWSER_LAUNCH_FAILED`, `NAVIGATION_FAILED`, `TIMEOUT`, `ARTIFACT_GENERATION_FAILED`, `ARTIFACT_LIMIT_EXCEEDED`).
+  - Error messages redact raw credentials (`user:pass@host`) and suppress internal stack traces.
+  - The pipeline orchestrator maps `CaptureError` directly to `Audit.status = 'failed'` with `failureReason = err.safeReason`.
+- **Lifecycle & Resource Ownership:**
+  - `CaptureService` owns the full Chromium lifecycle, ensuring idempotent, bounded cleanup (`RESOURCE_CLEANUP_TIMEOUT_MS = 2,000ms`) on success, error, or cancellation.
+- **Production Deployment Gates (Unchanged):**
+  - Production readiness strictly requires network namespace egress firewalling (dropping RFC 1918 / link-local / cloud metadata), dedicated worker container isolation, kernel cgroups (`--cpus=1.0`, `--memory=1g`), and supervisor-level container restarts on timeout.
+
+
 ## 5. Key Architectural Decisions
 
 | # | Decision | Chosen Approach | Reasoning | Reversible later? |

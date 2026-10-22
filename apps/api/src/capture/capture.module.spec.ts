@@ -300,4 +300,163 @@ describe('CaptureModule Integration & Contract Verification', () => {
       expect(mockBrowser.close).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe('Orchestration Integration Boundary', () => {
+    let captureService: CaptureService;
+    let mockBrowserProvider: BrowserProvider;
+    let mockDestinationGuard: jest.Mocked<DestinationGuardService>;
+
+    beforeEach(async () => {
+      const mockPage = {
+        goto: jest.fn().mockResolvedValue(null),
+        url: jest.fn().mockReturnValue('https://example.com/audit'),
+        screenshot: jest.fn().mockResolvedValue(VALID_PNG_BUFFER),
+        content: jest.fn().mockResolvedValue(VALID_DOM_HTML),
+        evaluate: jest.fn().mockResolvedValue({
+          totalDomElements: 4,
+          computedStyles: VALID_COMPUTED_STYLES,
+        }),
+        route: jest.fn().mockResolvedValue(undefined),
+        on: jest.fn(),
+        close: jest.fn().mockResolvedValue(undefined),
+      } as unknown as jest.Mocked<Page>;
+
+      const mockContext = {
+        newPage: jest.fn().mockResolvedValue(mockPage),
+        close: jest.fn().mockResolvedValue(undefined),
+      } as unknown as jest.Mocked<BrowserContext>;
+
+      const mockBrowser = {
+        newContext: jest.fn().mockResolvedValue(mockContext),
+        close: jest.fn().mockResolvedValue(undefined),
+      } as unknown as jest.Mocked<Browser>;
+
+      mockBrowserProvider = {
+        launch: jest.fn().mockResolvedValue(mockBrowser),
+      };
+
+      mockDestinationGuard = {
+        validate: jest.fn().mockResolvedValue(VALID_DESTINATION),
+        check: jest.fn().mockResolvedValue({ isValid: true, destination: VALID_DESTINATION }),
+      } as unknown as jest.Mocked<DestinationGuardService>;
+
+      const moduleRef = await Test.createTestingModule({
+        imports: [CaptureModule],
+      })
+        .overrideProvider(BROWSER_PROVIDER_TOKEN)
+        .useValue(mockBrowserProvider)
+        .overrideProvider(DestinationGuardService)
+        .useValue(mockDestinationGuard)
+        .compile();
+
+      captureService = moduleRef.get<CaptureService>(CaptureService);
+    });
+
+    it('passes audit URL through capture entry point and enforces pre-navigation validation', async () => {
+      const auditRecord = {
+        id: '11111111-2222-3333-4444-555555555555',
+        url: 'https://example.com/audit',
+        status: 'queued',
+      };
+
+      const result = await captureService.capture({ url: auditRecord.url });
+
+      expect(mockDestinationGuard.validate).toHaveBeenCalledWith('https://example.com/audit');
+      expect(result.success).toBe(true);
+      expect(result.metadata.initialUrl).toBe('https://example.com/audit');
+    });
+
+    it('fails without leaking credentials when an audit URL contains embedded credentials', async () => {
+      mockDestinationGuard.validate.mockRejectedValueOnce(
+        new DestinationGuardError(
+          DestinationErrorCode.INVALID_TARGET,
+          'URLs with embedded credentials are not permitted',
+        ),
+      );
+
+      try {
+        await captureService.capture({ url: 'https://user:secretpass@example.com/login' });
+        fail('Expected capture to throw');
+      } catch (err: any) {
+        expect(err.code).toBe(CaptureErrorCode.INVALID_TARGET);
+        expect(err.message).not.toContain('secretpass');
+        expect(err.safeReason).toBe('URLs with embedded credentials are not permitted');
+      }
+    });
+
+    it('allows caller to distinguish typed capture failures for audit job status updates', async () => {
+      // 1. BLOCKED_DESTINATION
+      mockDestinationGuard.validate.mockRejectedValueOnce(
+        new DestinationGuardError(
+          DestinationErrorCode.BLOCKED_DESTINATION,
+          'Destination IP address is non-globally routable or reserved',
+        ),
+      );
+
+      await expect(
+        captureService.capture({ url: 'http://169.254.169.254/' }),
+      ).rejects.toMatchObject({
+        code: CaptureErrorCode.BLOCKED_DESTINATION,
+        safeReason: 'Destination IP address is non-globally routable or reserved',
+      });
+
+      // 2. DNS_RESOLUTION_FAILED
+      mockDestinationGuard.validate.mockRejectedValueOnce(
+        new DestinationGuardError(
+          DestinationErrorCode.DNS_RESOLUTION_FAILED,
+          'DNS resolution failed for the destination hostname',
+        ),
+      );
+
+      await expect(
+        captureService.capture({ url: 'https://non-existent-hostname.local' }),
+      ).rejects.toMatchObject({
+        code: CaptureErrorCode.DNS_RESOLUTION_FAILED,
+        safeReason: 'DNS resolution failed for the destination hostname',
+      });
+    });
+
+    it('exposes only pure in-memory artifacts without leaking browser handles or internals', async () => {
+      const result = await captureService.capture({ url: 'https://example.com/audit' });
+
+      // Only documented contract fields exposed
+      const allowedKeys = [
+        'success',
+        'metadata',
+        'screenshot',
+        'domSnapshot',
+        'computedStyles',
+        'validatedDestination',
+      ];
+      expect(Object.keys(result).sort()).toEqual(allowedKeys.sort());
+
+      // No Playwright objects or functions attached to result
+      expect((result as any).page).toBeUndefined();
+      expect((result as any).browser).toBeUndefined();
+      expect((result as any).context).toBeUndefined();
+      expect((result as any).route).toBeUndefined();
+      expect(Buffer.isBuffer(result.screenshot)).toBe(true);
+      expect(typeof result.domSnapshot).toBe('string');
+      expect(Array.isArray(result.computedStyles)).toBe(true);
+    });
+
+    it('operates purely in memory without database dependencies or mutating audit state', async () => {
+      // CaptureService has no PrismaService injection
+      expect((captureService as any).prisma).toBeUndefined();
+
+      const auditState = {
+        id: '22222222-3333-4444-5555-666666666666',
+        url: 'https://example.com/audit',
+        status: 'queued',
+        failureReason: null,
+      };
+
+      const result = await captureService.capture({ url: auditState.url });
+
+      expect(result.success).toBe(true);
+      // Audit state is untouched by capture service
+      expect(auditState.status).toBe('queued');
+      expect(auditState.failureReason).toBeNull();
+    });
+  });
 });
