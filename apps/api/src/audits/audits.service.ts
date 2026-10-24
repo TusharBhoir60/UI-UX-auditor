@@ -12,9 +12,14 @@ import {
   AuditCreationResponse,
   AuditDetailResponse,
   AuditListItemResponse,
+  AuditResultsResponse,
   AuditStatusResponse,
+  EvidenceResultItem,
+  FindingSummaryCounts,
+  IssueResultItem,
 } from './audits.types';
 import { AuditQueueService } from '../queue/audit-queue.service';
+import { AuditFindingsService } from './audit-findings.service';
 import { sanitizeErrorMessage } from '../capture/capture.types';
 
 @Injectable()
@@ -25,6 +30,7 @@ export class AuditsService {
     private readonly prisma: PrismaService,
     @Inject(forwardRef(() => AuditQueueService))
     private readonly auditQueueService: AuditQueueService,
+    private readonly auditFindingsService: AuditFindingsService,
   ) {}
 
   /**
@@ -193,6 +199,114 @@ export class AuditsService {
       status: audit.status,
       stage: 'queued',
       failure_reason: audit.failureReason,
+    };
+  }
+
+  /**
+   * Retrieves aggregated results, summary counts, issues, and evidence for an audit.
+   * Strictly ownership-scoped: returns 404 if audit is not found or owned by another user.
+   */
+  async getResults(
+    userId: string,
+    auditId: string,
+  ): Promise<AuditResultsResponse> {
+    let audit;
+    try {
+      audit = await this.prisma.audit.findFirst({
+        where: {
+          id: auditId,
+          userId,
+        },
+        select: {
+          id: true,
+          url: true,
+          status: true,
+          failureReason: true,
+          createdAt: true,
+          completedAt: true,
+        },
+      });
+    } catch {
+      this.logger.error(`Database error while retrieving audit ${auditId}`);
+      throw new InternalServerErrorException('Failed to retrieve audit results');
+    }
+
+    if (!audit) {
+      throw new NotFoundException('Audit not found');
+    }
+
+    let rawIssues;
+    try {
+      rawIssues = await this.auditFindingsService.getAuditFindings(auditId);
+    } catch {
+      this.logger.error(`Failed to load findings for audit ${auditId}`);
+      throw new InternalServerErrorException('Failed to retrieve audit results');
+    }
+
+    // Compute consistent aggregate counts from persisted data
+    const summary: FindingSummaryCounts = {
+      total: rawIssues.length,
+      by_severity: {
+        Critical: 0,
+        High: 0,
+        Medium: 0,
+        Low: 0,
+      },
+      by_category: {
+        accessibility: 0,
+        visual: 0,
+        usability: 0,
+      },
+    };
+
+    const issues: IssueResultItem[] = rawIssues.map((issue) => {
+      if (issue.severity in summary.by_severity) {
+        summary.by_severity[issue.severity as keyof typeof summary.by_severity]++;
+      }
+      if (issue.category in summary.by_category) {
+        summary.by_category[issue.category as keyof typeof summary.by_category]++;
+      }
+
+      const evidence: EvidenceResultItem[] = (issue.evidence || []).map((ev) => ({
+        id: ev.id,
+        issue_id: ev.issueId,
+        dom_selector: ev.domSelector ?? null,
+        snippet: ev.snippet ?? null,
+        highlighted_region: (ev.highlightedRegion as {
+          x: number;
+          y: number;
+          width: number;
+          height: number;
+        } | null) ?? null,
+        screenshot_crop_url: ev.screenshotCropUrl ?? null,
+        created_at: ev.createdAt.toISOString(),
+      }));
+
+      return {
+        id: issue.id,
+        audit_id: issue.auditId,
+        category: issue.category,
+        title: issue.title,
+        description: issue.description,
+        severity: issue.severity,
+        confidence: issue.confidence,
+        standard_reference: issue.standardReference ?? null,
+        recommendation: issue.recommendation,
+        status: issue.status,
+        created_at: issue.createdAt.toISOString(),
+        evidence,
+      };
+    });
+
+    return {
+      audit_id: audit.id,
+      url: audit.url,
+      status: audit.status,
+      failure_reason: audit.failureReason,
+      created_at: audit.createdAt.toISOString(),
+      completed_at: audit.completedAt ? audit.completedAt.toISOString() : null,
+      summary,
+      issues,
     };
   }
 }

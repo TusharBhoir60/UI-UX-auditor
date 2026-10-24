@@ -177,18 +177,74 @@ describe('AuditFindingsService', () => {
   });
 
   describe('getAuditFindings', () => {
-    it('queries issues and evidence for audit ordered by createdAt', async () => {
-      mockPrismaService.issue.findMany.mockResolvedValueOnce([
-        { id: 'issue-1', auditId: AUDIT_ID, evidence: [] },
-      ]);
+    it('queries issues with evidence and applies deterministic sorting (severity -> createdAt -> id)', async () => {
+      const unorderedIssues = [
+        {
+          id: 'b-low-issue',
+          auditId: AUDIT_ID,
+          severity: 'Low',
+          createdAt: new Date('2026-10-22T10:00:00.000Z'),
+          evidence: [],
+        },
+        {
+          id: 'a-critical-issue',
+          auditId: AUDIT_ID,
+          severity: 'Critical',
+          createdAt: new Date('2026-10-22T10:01:00.000Z'),
+          evidence: [
+            {
+              id: 'ev-2',
+              createdAt: new Date('2026-10-22T10:01:05.000Z'),
+            },
+            {
+              id: 'ev-1',
+              createdAt: new Date('2026-10-22T10:01:01.000Z'),
+            },
+          ],
+        },
+        {
+          id: 'c-high-issue',
+          auditId: AUDIT_ID,
+          severity: 'High',
+          createdAt: new Date('2026-10-22T10:00:30.000Z'),
+          evidence: [],
+        },
+        {
+          id: 'd-critical-older',
+          auditId: AUDIT_ID,
+          severity: 'Critical',
+          createdAt: new Date('2026-10-22T10:00:10.000Z'),
+          evidence: [],
+        },
+      ];
+
+      mockPrismaService.issue.findMany.mockResolvedValueOnce(unorderedIssues);
 
       const findings = await service.getAuditFindings(AUDIT_ID);
-      expect(findings).toHaveLength(1);
       expect(mockPrismaService.issue.findMany).toHaveBeenCalledWith({
         where: { auditId: AUDIT_ID },
-        include: { evidence: true },
-        orderBy: { createdAt: 'asc' },
+        include: {
+          evidence: {
+            orderBy: [
+              { createdAt: 'asc' },
+              { id: 'asc' },
+            ],
+          },
+        },
+        orderBy: [
+          { severity: 'asc' },
+          { createdAt: 'asc' },
+          { id: 'asc' },
+        ],
       });
+
+      expect(findings).toHaveLength(4);
+      // Critical (older) first, then Critical (newer), then High, then Low
+      expect(findings[0].id).toBe('d-critical-older');
+      expect(findings[1].id).toBe('a-critical-issue');
+      expect(findings[2].id).toBe('c-high-issue');
+      expect(findings[3].id).toBe('b-low-issue');
     });
   });
+
 });

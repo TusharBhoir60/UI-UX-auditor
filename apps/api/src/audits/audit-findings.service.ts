@@ -102,12 +102,49 @@ export class AuditFindingsService {
 
   /**
    * Loads persisted issues and evidence for a given audit ID.
+   * Returned issues are deterministically ordered by:
+   * 1. Severity: Critical -> High -> Medium -> Low
+   * 2. Creation time: Oldest first (createdAt asc)
+   * 3. ID: Lexicographical tie-breaker (id asc)
+   * Evidence records within each issue are ordered by createdAt asc, id asc.
    */
   async getAuditFindings(auditId: string) {
-    return this.prisma.issue.findMany({
+    const issues = await this.prisma.issue.findMany({
       where: { auditId },
-      include: { evidence: true },
-      orderBy: { createdAt: 'asc' },
+      include: {
+        evidence: {
+          orderBy: [
+            { createdAt: 'asc' },
+            { id: 'asc' },
+          ],
+        },
+      },
+      orderBy: [
+        { severity: 'asc' },
+        { createdAt: 'asc' },
+        { id: 'asc' },
+      ],
+    });
+
+    const severityOrder: Record<string, number> = {
+      Critical: 1,
+      High: 2,
+      Medium: 3,
+      Low: 4,
+    };
+
+    return issues.sort((a, b) => {
+      const weightA = severityOrder[a.severity] ?? 99;
+      const weightB = severityOrder[b.severity] ?? 99;
+      if (weightA !== weightB) {
+        return weightA - weightB;
+      }
+      const timeA = new Date(a.createdAt).getTime();
+      const timeB = new Date(b.createdAt).getTime();
+      if (timeA !== timeB) {
+        return timeA - timeB;
+      }
+      return a.id.localeCompare(b.id);
     });
   }
 }
