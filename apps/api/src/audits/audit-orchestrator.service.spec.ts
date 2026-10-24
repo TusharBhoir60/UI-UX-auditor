@@ -13,6 +13,9 @@ import {
   AuditState,
 } from './audit-orchestrator.types';
 
+import { RuleEngineService } from '../rules/rule-engine.service';
+import { AuditFindingsService } from './audit-findings.service';
+
 describe('AuditOrchestratorService', () => {
   let service: AuditOrchestratorService;
   let mockPrismaService: {
@@ -23,6 +26,13 @@ describe('AuditOrchestratorService', () => {
   };
   let mockCaptureService: {
     capture: jest.Mock;
+  };
+  let mockRuleEngineService: {
+    evaluate: jest.Mock;
+  };
+  let mockAuditFindingsService: {
+    persistFindings: jest.Mock;
+    getAuditFindings: jest.Mock;
   };
 
   const AUDIT_ID = '11111111-2222-3333-4444-555555555555';
@@ -69,6 +79,25 @@ describe('AuditOrchestratorService', () => {
       capture: jest.fn(),
     };
 
+    mockRuleEngineService = {
+      evaluate: jest.fn().mockResolvedValue({
+        evaluatedAt: new Date().toISOString(),
+        durationMs: 15,
+        rulesEvaluatedCount: 5,
+        passedRulesCount: 5,
+        findingRulesCount: 0,
+        notEvaluableRulesCount: 0,
+        totalFindingsCount: 0,
+        results: [],
+        findings: [],
+      }),
+    };
+
+    mockAuditFindingsService = {
+      persistFindings: jest.fn().mockResolvedValue(0),
+      getAuditFindings: jest.fn().mockResolvedValue([]),
+    };
+
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         AuditOrchestratorService,
@@ -79,6 +108,14 @@ describe('AuditOrchestratorService', () => {
         {
           provide: CaptureService,
           useValue: mockCaptureService,
+        },
+        {
+          provide: RuleEngineService,
+          useValue: mockRuleEngineService,
+        },
+        {
+          provide: AuditFindingsService,
+          useValue: mockAuditFindingsService,
         },
       ],
     }).compile();
@@ -144,6 +181,7 @@ describe('AuditOrchestratorService', () => {
         auditId: AUDIT_ID,
         status: 'complete',
         captureMetadata: MOCK_CAPTURE_RESULT.metadata,
+        findingsCount: 0,
       });
     });
   });
@@ -410,6 +448,135 @@ describe('AuditOrchestratorService', () => {
         code: AuditOrchestrationErrorCode.PERSISTENCE_FAILED,
         safeMessage: 'Failed to persist terminal failure status',
       });
+    });
+  });
+
+  describe('Pipeline Integration: Rule Evaluation and Finding Persistence', () => {
+    it('evaluates rules and persists findings on successful capture, transitioning to complete', async () => {
+      mockPrismaService.audit.findUnique.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        url: STORED_URL,
+        status: AuditState.QUEUED,
+      });
+
+      mockPrismaService.audit.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // claim
+        .mockResolvedValueOnce({ count: 1 }); // complete
+
+      mockCaptureService.capture.mockResolvedValueOnce(MOCK_CAPTURE_RESULT);
+
+      const mockFinding = {
+        ruleId: 'img-alt-present',
+        ruleVersion: '1.0.0',
+        category: 'accessibility',
+        severity: 'Critical',
+        confidence: 'deterministic',
+        title: 'Image missing alt',
+        description: 'No alt text',
+        recommendation: 'Add alt',
+        evidence: {},
+      };
+
+      mockRuleEngineService.evaluate.mockResolvedValueOnce({
+        evaluatedAt: new Date().toISOString(),
+        durationMs: 25,
+        rulesEvaluatedCount: 5,
+        passedRulesCount: 4,
+        findingRulesCount: 1,
+        notEvaluableRulesCount: 0,
+        totalFindingsCount: 1,
+        results: [],
+        findings: [mockFinding],
+      });
+
+      mockAuditFindingsService.persistFindings.mockResolvedValueOnce(1);
+
+      const result = await service.processAudit(AUDIT_ID);
+
+      expect(result.status).toBe('complete');
+      expect((result as any).findingsCount).toBe(1);
+      expect(mockRuleEngineService.evaluate).toHaveBeenCalledWith({
+        domSnapshot: MOCK_CAPTURE_RESULT.domSnapshot,
+        computedStyles: MOCK_CAPTURE_RESULT.computedStyles,
+        url: STORED_URL,
+      });
+      expect(mockAuditFindingsService.persistFindings).toHaveBeenCalledWith(
+        AUDIT_ID,
+        [mockFinding],
+      );
+    });
+
+    it('does not invoke rule engine or persistence if capture fails', async () => {
+      mockPrismaService.audit.findUnique.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        url: STORED_URL,
+        status: AuditState.QUEUED,
+      });
+
+      mockPrismaService.audit.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // claim
+        .mockResolvedValueOnce({ count: 1 }); // fail
+
+      mockCaptureService.capture.mockRejectedValueOnce(
+        new CaptureError(
+          CaptureErrorCode.BLOCKED_DESTINATION,
+          'Destination blocked',
+        ),
+      );
+
+      const result = await service.processAudit(AUDIT_ID);
+
+      expect(result.status).toBe('failed');
+      expect(mockRuleEngineService.evaluate).not.toHaveBeenCalled();
+      expect(mockAuditFindingsService.persistFindings).not.toHaveBeenCalled();
+    });
+
+    it('transitions audit to failed if rule engine throws unexpectedly', async () => {
+      mockPrismaService.audit.findUnique.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        url: STORED_URL,
+        status: AuditState.QUEUED,
+      });
+
+      mockPrismaService.audit.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // claim
+        .mockResolvedValueOnce({ count: 1 }); // fail update
+
+      mockCaptureService.capture.mockResolvedValueOnce(MOCK_CAPTURE_RESULT);
+      mockRuleEngineService.evaluate.mockRejectedValueOnce(
+        new Error('Rule engine crash'),
+      );
+
+      const result = await service.processAudit(AUDIT_ID);
+
+      expect(result.status).toBe('failed');
+      expect((result as any).failureReason).toContain('Rule evaluation failed');
+      expect(mockAuditFindingsService.persistFindings).not.toHaveBeenCalled();
+    });
+
+    it('transitions audit to failed if finding persistence throws', async () => {
+      mockPrismaService.audit.findUnique.mockResolvedValueOnce({
+        id: AUDIT_ID,
+        url: STORED_URL,
+        status: AuditState.QUEUED,
+      });
+
+      mockPrismaService.audit.updateMany
+        .mockResolvedValueOnce({ count: 1 }) // claim
+        .mockResolvedValueOnce({ count: 1 }); // fail update
+
+      mockCaptureService.capture.mockResolvedValueOnce(MOCK_CAPTURE_RESULT);
+      mockAuditFindingsService.persistFindings.mockRejectedValueOnce(
+        new AuditOrchestrationError(
+          AuditOrchestrationErrorCode.PERSISTENCE_FAILED,
+          'DB deadlock',
+        ),
+      );
+
+      const result = await service.processAudit(AUDIT_ID);
+
+      expect(result.status).toBe('failed');
+      expect((result as any).failureReason).toBe('Failed to persist audit findings');
     });
   });
 });

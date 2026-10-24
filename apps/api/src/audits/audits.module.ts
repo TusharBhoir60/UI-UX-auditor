@@ -6,16 +6,19 @@ import { DatabaseModule } from '../database/database.module';
 import { AuthModule } from '../auth/auth.module';
 import { CaptureModule } from '../capture/capture.module';
 import { QueueModule } from '../queue/queue.module';
+import { RulesModule } from '../rules/rules.module';
+import { AuditFindingsService } from './audit-findings.service';
 
 @Module({
   imports: [
     DatabaseModule,
     AuthModule,
     CaptureModule,
+    RulesModule,
     forwardRef(() => QueueModule),
   ],
   controllers: [AuditsController],
-  providers: [AuditsService, AuditOrchestratorService],
-  exports: [AuditsService, AuditOrchestratorService],
+  providers: [AuditsService, AuditOrchestratorService, AuditFindingsService],
+  exports: [AuditsService, AuditOrchestratorService, AuditFindingsService],
 })
 export class AuditsModule {}

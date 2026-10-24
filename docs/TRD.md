@@ -195,6 +195,84 @@ To decouple HTTP audit submission from browser execution and external network la
   - *Indefinite Infrastructure Outages:* Reconciliation cannot guarantee recovery if Redis or PostgreSQL remains permanently unavailable; recovery occurs deterministically once services become reachable.
   - *Fencing Tokens:* Stage 6+ multi-stage pipeline extension should introduce a fencing token or attempt-counter on `Audit` to allow safe multi-attempt automatic retries.
 
+### 4c. Deterministic Rule Engine Module (`RulesModule`)
+
+To establish high trust and reproducible audit outcomes, deterministic analysis is decoupled from qualitative AI analysis and browser orchestration:
+
+- **Module Responsibility:**
+  - Evaluates captured page artifacts (`domSnapshot`, `computedStyles`) against exact, code-defined web accessibility and interface-quality standards.
+  - Enforces the governing principle from `AI_RULES.md`: checks with exact standards (`WCAG 1.1.1`, `WCAG 1.3.1`, `WCAG 1.4.3`, `WCAG 2.4.2`, `WCAG 4.1.2`) are computed deterministically. AI is reserved strictly for subjective visual hierarchy and heuristic evaluations.
+- **Input and Output Contracts:**
+  - **Input (`RuleEvidenceInput`):**
+    - `domSnapshot`: string containing the UTF-8 HTML document.
+    - `computedStyles`: array of bounded `ElementComputedStyle` extracted by `CaptureService`.
+    - `url`: optional target landing URL.
+  - **Output (`RuleEngineResult`):**
+    - `evaluatedAt`: ISO timestamp.
+    - `durationMs`: execution duration in milliseconds.
+    - `rulesEvaluatedCount`: total rules registered and executed.
+    - `passedRulesCount`, `findingRulesCount`, `notEvaluableRulesCount`, `totalFindingsCount`.
+    - `results`: detailed per-rule outcomes (`RuleResult`) with status (`pass` | `finding` | `not-evaluable`), element counts, and failure reasons.
+    - `findings`: flattened array of discrete, typed `RuleFinding` records for downstream aggregation.
+- **Rule Execution Boundary:**
+  - `RuleEngineService.evaluate()` is a pure, in-memory CPU operation.
+  - It does NOT launch browsers, does NOT access Redis or message queues, does NOT interact with PostgreSQL or update audit records, and does NOT execute page-provided JavaScript.
+  - Each rule executes inside an isolated try-catch block; an unexpected failure in one rule is reported as `not-evaluable` without aborting remaining rules or crashing the process.
+- **Evidence Traceability:**
+  - Every `RuleFinding` includes a typed `evidence` record containing:
+    - `selector`: CSS selector matching the DOM element.
+    - `tagName`: normalized HTML tag name.
+    - `snippet`: raw HTML snippet of the element (bounded length).
+    - `boundingBox`: `{ x, y, width, height }` coordinates if correlated from captured computed styles.
+    - `expected`: standard requirement or threshold.
+    - `observed`: actual measurement or missing attribute.
+- **Handling of Missing or Ambiguous Evidence:**
+  - Missing evidence is never falsely reported as a pass.
+  - When input HTML is empty or unparseable, rules return `not-evaluable` with a descriptive reason.
+  - When computed styles lack explicit opaque background colors (e.g., transparent `rgba(0, 0, 0, 0)` or inherited backgrounds), the contrast rule (`text-contrast-minimum`) returns `not-evaluable` rather than fabricating an arbitrary background color.
+- **Implemented Initial Rule Set:**
+  1. `doc-title-present` (WCAG 2.4.2 Level A): Verifies non-empty document `<title>`.
+  2. `img-alt-present` (WCAG 1.1.1 Level A): Verifies presence of descriptive `alt` attribute or explicit decorative marker (`alt=""`, `role="presentation"`, `aria-hidden="true"`).
+  3. `button-name-present` (WCAG 4.1.2 Level A): Verifies accessible name on `<button>` elements (inner text, `aria-label`, `aria-labelledby`, or `title`).
+  4. `heading-order-valid` (WCAG 1.3.1 Level A): Verifies presence of top-level `<h1>`, non-empty heading text, and sequential hierarchy without skipped levels.
+  5. `text-contrast-minimum` (WCAG 1.4.3 Level AA): Computes exact relative luminance contrast ratio for text with explicit opaque backgrounds (4.5:1 standard, 3.0:1 large text); safely marks unresolvable backgrounds as `not-evaluable`.
+
+### 4d. Pipeline Integration, Rule Correctness, and Finding Persistence
+
+- **Pipeline Execution Sequence (`AuditOrchestratorService`):**
+  1. *Audit Claiming:* The background worker invokes `auditOrchestratorService.executeAudit(auditId)`. An atomic conditional update claims the audit (`queued` -> `running`).
+  2. *Target URL Resolution:* The authoritative URL is resolved from the PostgreSQL `Audit` record (never from unvalidated queue payload data).
+  3. *Browser Capture:* `CaptureService.capture(url)` executes sandboxed browser capture with SSRF destination guarding, producing the transient `CaptureResult` (`domSnapshot`, `computedStyles`, `screenshot`).
+  4. *Deterministic Rule Evaluation:* `RuleEngineService.evaluate()` evaluates the captured DOM snapshot and bounded computed styles against the deterministic rule set in memory.
+  5. *Finding Persistence:* `AuditFindingsService.persistFindings()` atomically writes finding records to PostgreSQL.
+  6. *Terminal State Transition:* Upon successful persistence, the orchestrator updates the audit status to `complete` with `completedAt = now()`.
+- **Finding & Evidence Persistence Model:**
+  - Persisted models: `Issue` and `Evidence` entities created in PostgreSQL via Prisma migrations.
+  - `Issue` fields: `id` (UUID), `auditId` (FK with cascade delete), `category` (`accessibility`, `visual`, `usability`), `title`, `description`, `severity` (`Critical`, `High`, `Medium`, `Low`), `confidence` (`deterministic`, `high`, `medium`, `low`), `standardReference` (nullable string), `recommendation` (string), `status` (`open`, `acknowledged`, `fixed`), `createdAt`.
+  - `Evidence` fields: `id` (UUID), `issueId` (FK with cascade delete), `screenshotCropUrl` (nullable string), `highlightedRegion` (nullable JSONB `{ x, y, width, height }`), `domSelector` (nullable string), `createdAt`.
+  - Actionable findings only: Only rules resulting in `finding` produce user-facing `Issue` and `Evidence` records. `pass` and `not-evaluable` outcomes are retained in memory and logged; they are never persisted as issues.
+  - Optional visual artifacts: `screenshotCropUrl` is stored as `null` until dedicated visual cropping storage is implemented (no fake URLs fabricated).
+- **Transaction & Idempotency Strategy:**
+  - Dedicated service: `AuditFindingsService` owns the persistence boundary.
+  - Atomic Prisma Transaction: Finding and evidence records are persisted within an atomic `prisma.$transaction`.
+  - Re-run Idempotency: Inside the transaction, any pre-existing issues for the audit are deleted (`tx.issue.deleteMany({ where: { auditId } })`), automatically cascading to associated evidence. This prevents duplicate findings if a job is reconciled or re-executed.
+  - Transaction Scoping: Database transactions are kept strictly short (<100ms) and never held open across external I/O, browser capture, or rule evaluation.
+- **Error Handling & Terminal Failure Guarantees:**
+  - Zero-finding audits: Audits with 0 findings represent clean pages and are treated as successful completions (`findingsCount: 0`).
+  - Capture failure: Prevents rule evaluation and transitions the audit to `failed`.
+  - Rule evaluation failure: If unexpected internal errors occur during rule execution, `handleTerminalFailure` transitions the audit to `failed`.
+  - Persistence failure: If the database transaction fails, the error is caught, logged with sanitized metadata, and the audit is marked `failed`. An audit is never marked `complete` before deterministic findings are persisted.
+  - State ownership: `AuditWorkerProcessor` handles queue delivery only; `AuditOrchestratorService` remains the sole authority for audit status transitions.
+- **Rule Correctness & Evidence Grounding:**
+  - `button-name-present`: Resolves `aria-labelledby` against actual document element IDs collected from DOM evidence; requires non-empty referenced text; validates that `title` is non-empty; marks ambiguous or unresolvable references as missing or not-evaluable.
+  - `text-contrast-minimum`: Rejects alpha channels (< 0.99) and unparseable color notations; requires verifiable opaque foreground and background styles; returns `not-evaluable` for transparent or inherited backgrounds without fabricating assumptions.
+  - `heading-order-valid`: Distinguishes structural hierarchy heuristics (skipped heading levels, missing `h1`) from definitive accessibility barriers (empty headings).
+  - Grounded selectors: Selectors use element IDs where available or tag names with classes and bounded positional `:nth-of-type(n)` indexes; never invents attributes or bounding boxes.
+- **Known Limitations:**
+  - *Contrast compositing:* Background images, CSS gradients, canvas elements, and inherited stacking contexts cannot be flattened from single-element computed styles and safely yield `not-evaluable`.
+  - *Dynamic DOM:* Single-page applications mutating DOM after initial network idle may produce selectors requiring re-evaluation on live DOM.
+  - *Deferred models:* `AuditCapture`, `Report`, and `Job` models from `DATA_MODEL.md` remain deferred; capture artifacts are transient in memory during MVP execution.
+
 ## 5. Key Architectural Decisions
 
 | # | Decision | Chosen Approach | Reasoning | Reversible later? |

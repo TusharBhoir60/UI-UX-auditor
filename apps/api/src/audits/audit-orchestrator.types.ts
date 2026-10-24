@@ -42,6 +42,7 @@ export interface AuditOrchestrationSuccess {
   readonly auditId: string;
   readonly status: 'complete';
   readonly captureMetadata: CaptureMetadata;
+  readonly findingsCount?: number;
 }
 
 /**
